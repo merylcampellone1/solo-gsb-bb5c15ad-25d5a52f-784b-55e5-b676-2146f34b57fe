@@ -1,0 +1,22 @@
+{
+  "name": "light-quota",
+  "version": "1.0.0",
+  "description": "纸质展品光照额度管理 Web 应用",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test:utils": "node scripts/test-utils.js",
+    "test:integration": "node scripts/test-integration.js",
+    "test": "node scripts/test-utils.js && node scripts/test-integration.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "pg-mem": "^2.8.0"
+  }
+}

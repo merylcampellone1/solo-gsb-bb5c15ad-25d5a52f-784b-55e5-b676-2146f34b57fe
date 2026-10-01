@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>纸质展品光照额度管理</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="login-view" class="login-wrap hidden">
+    <form id="login-form" class="card login-card">
+      <h1>纸质展品光照额度管理</h1>
+      <p class="muted">本地账号登录，区分「保管员」与「布展员」</p>
+      <label>用户名<input name="username" autocomplete="username" required /></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required /></label>
+      <button type="submit" class="primary">登录</button>
+      <div id="login-error" class="error"></div>
+      <div class="muted small">
+        默认账号：保管员 <code>custodian / guard123</code>；布展员 <code>installer / setup123</code>
+      </div>
+    </form>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app-view" class="hidden">
+    <header class="topbar">
+      <div class="brand">纸质展品光照额度管理</div>
+      <nav class="tabs">
+        <button data-tab="exhibits" class="tab active">展品与额度</button>
+        <button data-tab="plans" class="tab">布展计划</button>
+        <button data-tab="measurements" class="tab">实测记录</button>
+        <button data-tab="users" class="tab conservator-only">账号</button>
+        <button data-tab="audit" class="tab conservator-only">操作流水</button>
+      </nav>
+      <div class="user-box">
+        <span id="user-info"></span>
+        <button id="logout-btn" class="link">退出</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <div id="global-message"></div>
+
+      <!-- 展品与额度 -->
+      <section id="tab-exhibits" class="tab-panel">
+        <div class="panel-head">
+          <h2>展品与年度额度</h2>
+          <button id="new-exhibit-btn" class="primary conservator-only">登记展品</button>
+        </div>
+        <div id="exhibit-list" class="grid"></div>
+
+        <div id="exhibit-detail" class="detail hidden">
+          <div class="panel-head">
+            <h3 id="detail-title"></h3>
+            <button id="close-detail" class="link">返回列表</button>
+          </div>
+          <p id="detail-meta" class="muted"></p>
+
+          <h4>各自然年额度（lx·h）</h4>
+          <table class="data">
+            <thead><tr><th>年份</th><th>年度上限</th><th>已占用</th><th>剩余额度</th><th>状态</th></tr></thead>
+            <tbody id="year-tbody"></tbody>
+          </table>
+
+          <form id="limit-form" class="inline-form conservator-only">
+            <span>登记/修改年度上限：</span>
+            <input name="year" type="number" min="1900" max="2999" placeholder="年份，如 2026" required />
+            <input name="limitLxh" type="number" step="0.001" min="0.001" placeholder="上限 lx·h" required />
+            <button class="primary">保存上限</button>
+            <button type="button" id="limit-preview-btn">下调预演</button>
+          </form>
+          <p class="muted small conservator-only">
+            下调既有年度上限时建议先点「下调预演」：预演不改数据，给出该年已确认实测、各计划估算残余、预计超额量，
+            以及超额时将被转为「待复核」的未开始已批准计划；确认无误后在预演结果中提交。
+            预演后若额度或占用被他人改动，提交会被拒绝并返回最新结果。
+          </p>
+
+          <div id="limit-preview-box" class="card hidden conservator-only"></div>
+
+          <h4>额度占用来源</h4>
+          <div id="sources-list"></div>
+
+          <h4>布展计划</h4>
+          <table class="data">
+            <thead><tr><th>#</th><th>名称</th><th>展期</th><th>每日开灯</th><th>预计照度</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="detail-plan-tbody"></tbody>
+          </table>
+
+          <div id="pair-box" class="card conservator-only">
+            <h4>成对核准调整申请（同一展品两份待审申请）</h4>
+            <p class="muted small">选择本展品两条不同计划的待审调整申请，先「成对试算」再「提交成对核准」：
+              两份拟改开灯窗同时替换原窗（可用于两条计划互换/协同挪动档期）；
+              任一核对不通过则两份申请都保持待审、计划与额度不变。</p>
+            <div class="form-row">
+              <label class="grow">申请一<select id="pair-first"></select></label>
+              <label class="grow">申请二<select id="pair-second"></select></label>
+            </div>
+            <div class="adj-btns">
+              <button type="button" id="pair-preview-btn">成对试算</button>
+              <button type="button" id="pair-approve-btn" class="primary">提交成对核准</button>
+            </div>
+            <div id="pair-result"></div>
+          </div>
+
+          <h4>实测记录</h4>
+          <table class="data">
+            <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="detail-meas-tbody"></tbody>
+          </table>
+
+          <h4>停灯记录（永久保留，不可修改/删除）</h4>
+          <p class="muted small">停灯只从所属计划“未被已确认实测覆盖”的估算时段中扣减（按自然年拆分）；
+            不减已确认实测，也不释放原计划排期占用。停灯时段与未作废实测互斥。布展员只读。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>停灯原因</th><th>按年估算扣减 lx·h</th><th>登记人</th></tr></thead>
+            <tbody id="detail-blackout-tbody"></tbody>
+          </table>
+          <form id="blackout-form" class="inline-form conservator-only">
+            <span>登记已发生停灯：</span>
+            <select name="planId" id="blackout-plan-select" required></select>
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" required />
+            <span>至</span>
+            <input name="endDate" type="date" />
+            <input name="endTime" type="time" required />
+            <input name="reason" maxlength="1000" placeholder="停灯原因（必填）" required />
+            <button class="primary">登记停灯</button>
+          </form>
+          <p class="muted small conservator-only">
+            起点须早于终点，结束不得晚于当前时间；时段必须完整落在所选计划的开灯窗内，
+            且不得与同展品未作废实测或其他停灯记录相交。失败会指出冲突且不保存。
+          </p>
+        </div>
+      </section>
+
+      <!-- 布展计划 -->
+      <section id="tab-plans" class="tab-panel hidden">
+        <div class="panel-head"><h2>布展计划</h2></div>
+        <form id="plan-form" class="card installer-only">
+          <h4>新建展出计划（布展员）</h4>
+          <div class="form-row">
+            <label>展品<select name="exhibitId" id="plan-exhibit-select" required></select></label>
+            <label>计划名称<input name="title" required placeholder="如：春季特展" /></label>
+          </div>
+          <div class="form-row">
+            <label>开始日期<input name="startDate" type="date" required /></label>
+            <label>结束日期<input name="endDate" type="date" required /></label>
+            <label>预计照度 lx<input name="estimatedLux" type="number" step="0.01" min="0.01" required /></label>
+          </div>
+          <div class="form-row">
+            <label class="grow">每日开灯时段（每行一个，HH:MM-HH:MM，可跨午夜）
+              <textarea name="periods" rows="2" placeholder="09:00-12:00&#10;13:00-17:00" required></textarea>
+            </label>
+          </div>
+          <button class="primary" type="submit">提交计划（系统按自然年拆分预计剂量）</button>
+        </form>
+
+        <div id="adjustment-form-box" class="card installer-only hidden">
+          <div class="panel-head">
+            <h4>提交计划调整申请（已批准且尚未开始的计划）</h4>
+            <button id="adjustment-cancel" type="button" class="link">收起</button>
+          </div>
+          <form id="adjustment-form">
+            <div class="form-row">
+              <label class="grow">目标计划<input name="planLabel" readonly /></label>
+            </div>
+            <div class="form-row">
+              <label>新开始日期<input name="startDate" type="date" required /></label>
+              <label>新结束日期<input name="endDate" type="date" required /></label>
+              <label>新预计照度 lx<input name="estimatedLux" type="number" step="0.01" min="0.01" required /></label>
+            </div>
+            <div class="form-row">
+              <label class="grow">新每日开灯时段（每行一个，HH:MM-HH:MM，可跨午夜）
+                <textarea name="periods" rows="2" required></textarea>
+              </label>
+            </div>
+            <label>调整原因（可选）<input name="reason" maxlength="1000" /></label>
+            <button class="primary" type="submit">提交调整申请</button>
+            <p class="muted small">同一计划同时只允许一份待审申请，撤回后可重新提交。待审期间原计划继续占用额度；
+              保管员批准时会重新核对计划状态、未作废实测是否都在新窗口内、与其他计划是否重叠以及各年度额度。</p>
+          </form>
+        </div>
+
+        <div id="plan-list"></div>
+      </section>
+
+      <!-- 实测记录 -->
+      <section id="tab-measurements" class="tab-panel hidden">
+        <div class="panel-head"><h2>实测记录</h2></div>
+        <form id="meas-form" class="card conservator-only">
+          <h4>录入已批准计划内的实测时段（保管员）</h4>
+          <div class="form-row">
+            <label class="grow">计划<select name="planId" id="meas-plan-select" required></select></label>
+          </div>
+          <div class="form-row">
+            <label>开始日期<input name="startDate" type="date" required /></label>
+            <label>开始时间<input name="startTime" type="time" required /></label>
+            <label>结束日期<input name="endDate" type="date" /></label>
+            <label>结束时间<input name="endTime" type="time" required /></label>
+            <label>实测照度 lx<input name="actualLux" type="number" step="0.01" min="0.01" required /></label>
+          </div>
+          <label>备注（可选）<input name="note" maxlength="1000" /></label>
+          <button class="primary" type="submit">录入（待确认）</button>
+          <p class="muted small">确认后该时段以实测剂量替代估算；重叠实测会被拒绝。若迟到实测导致超限，相应年度尚未开始的计划自动转「待复核」。</p>
+        </form>
+        <div id="meas-list"></div>
+      </section>
+
+      <!-- 账号 -->
+      <section id="tab-users" class="tab-panel hidden">
+        <div class="panel-head"><h2>本地账号（保管员管理）</h2></div>
+        <form id="user-form" class="card">
+          <h4>新建账号</h4>
+          <div class="form-row">
+            <label>用户名<input name="username" required /></label>
+            <label>显示名<input name="displayName" /></label>
+            <label>角色
+              <select name="role">
+                <option value="installer">布展员</option>
+                <option value="conservator">保管员</option>
+              </select>
+            </label>
+            <label>初始密码（≥6位）<input name="password" type="text" minlength="6" required /></label>
+          </div>
+          <button class="primary">创建</button>
+        </form>
+        <table class="data">
+          <thead><tr><th>#</th><th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="user-tbody"></tbody>
+        </table>
+      </section>
+
+      <!-- 操作流水 -->
+      <section id="tab-audit" class="tab-panel hidden">
+        <div class="panel-head"><h2>操作流水</h2></div>
+        <table class="data">
+          <thead><tr><th>#</th><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr></thead>
+          <tbody id="audit-tbody"></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

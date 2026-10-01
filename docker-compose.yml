@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: lightquota-db
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-lightquota}
+      POSTGRES_USER: ${PGUSER:-lightquota}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-lightquota_secret}
+    volumes:
+      - lightquota_pgdata:/var/lib/postgresql/data
+    ports:
+      # 仅映射到本机，便于排查；不需要可删除此段
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-lightquota} -d ${PGDATABASE:-lightquota}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    container_name: lightquota-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-lightquota}
+      PGUSER: ${PGUSER:-lightquota}
+      PGPASSWORD: ${PGPASSWORD:-lightquota_secret}
+      TZ_OFFSET_MINUTES: ${TZ_OFFSET_MINUTES:-480}
+      SEED_CONSERVATOR_USERNAME: ${SEED_CONSERVATOR_USERNAME:-custodian}
+      SEED_CONSERVATOR_PASSWORD: ${SEED_CONSERVATOR_PASSWORD:-guard123}
+      SEED_INSTALLER_USERNAME: ${SEED_INSTALLER_USERNAME:-installer}
+      SEED_INSTALLER_PASSWORD: ${SEED_INSTALLER_PASSWORD:-setup123}
+      SEED_DEMO: ${SEED_DEMO:-true}
+    ports:
+      - "${PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  lightquota_pgdata:

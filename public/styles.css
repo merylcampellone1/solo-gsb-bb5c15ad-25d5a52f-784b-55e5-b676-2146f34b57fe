@@ -1,0 +1,134 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+  background: #f4f5f7;
+  color: #1f2933;
+}
+.hidden { display: none !important; }
+.muted { color: #6b7280; }
+.small { font-size: 12px; }
+code { background: #eef0f2; padding: 1px 5px; border-radius: 3px; }
+
+/* 登录 */
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-card { width: 380px; padding: 28px; }
+.login-card h1 { font-size: 20px; margin: 0 0 6px; }
+.login-card label { display: block; margin: 12px 0; font-size: 14px; color: #374151; }
+.login-card input { width: 100%; padding: 9px 10px; margin-top: 4px; border: 1px solid #cbd2d9; border-radius: 6px; }
+
+.card {
+  background: #fff; border: 1px solid #e4e7eb; border-radius: 10px;
+  padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+}
+
+/* 顶栏 */
+.topbar {
+  display: flex; align-items: center; gap: 18px; background: #12324d;
+  color: #fff; padding: 0 20px; height: 56px;
+}
+.brand { font-weight: 700; white-space: nowrap; }
+.tabs { display: flex; gap: 4px; flex: 1; }
+.tab {
+  background: transparent; border: none; color: #cfe0ee; padding: 8px 14px;
+  border-radius: 6px; cursor: pointer; font-size: 14px;
+}
+.tab:hover { background: rgba(255,255,255,.1); }
+.tab.active { background: #1f5f8b; color: #fff; }
+.user-box { white-space: nowrap; font-size: 13px; }
+.user-box .link { color: #bddcf2; }
+
+.content { padding: 20px; max-width: 1200px; margin: 0 auto; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+h2 { font-size: 18px; margin: 0; }
+h3 { font-size: 17px; margin: 0; }
+h4 { margin: 18px 0 8px; font-size: 15px; }
+
+button {
+  cursor: pointer; border: 1px solid #cbd2d9; background: #fff;
+  border-radius: 6px; padding: 7px 13px; font-size: 13px;
+}
+button:hover { background: #f0f2f5; }
+button.primary { background: #1f6f9e; border-color: #1f6f9e; color: #fff; }
+button.primary:hover { background: #1a5f88; }
+button.danger { color: #b42318; border-color: #f0b8b0; }
+button.link { border: none; background: transparent; color: #1f6f9e; padding: 4px 6px; }
+button.small-btn { padding: 3px 8px; font-size: 12px; }
+
+input, select, textarea {
+  padding: 7px 9px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 13px;
+  font-family: inherit;
+}
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #374151; }
+.form-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0; }
+.form-row label { flex: 1; min-width: 150px; }
+.form-row .grow { flex: 3; }
+.inline-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin: 10px 0 18px; }
+.inline-form input { width: 150px; }
+
+/* 展品卡片 */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.exhibit-card { cursor: pointer; }
+.exhibit-card:hover { border-color: #90c2df; }
+.exhibit-card h3 { margin-bottom: 4px; }
+.exhibit-card .acc { font-size: 12px; color: #6b7280; }
+.year-chips { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+.chip {
+  display: flex; justify-content: space-between; align-items: center;
+  background: #f6f8fa; border-radius: 6px; padding: 5px 10px; font-size: 12.5px;
+}
+.chip.over { background: #fdeceb; color: #b42318; font-weight: 600; }
+.chip.warn { background: #fff5e0; color: #9a6700; }
+
+table.data { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; }
+table.data th, table.data td { border: 1px solid #e4e7eb; padding: 7px 9px; text-align: left; vertical-align: top; }
+table.data th { background: #f0f3f6; font-weight: 600; }
+tr.over-row td { background: #fdeceb; }
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+}
+.badge.submitted { background: #e0ecff; color: #1d4f91; }
+.badge.approved { background: #dcf5e7; color: #176b3a; }
+.badge.rejected { background: #fdeceb; color: #b42318; }
+.badge.cancelled { background: #eceff3; color: #6b7280; }
+.badge.pending_review { background: #fff1da; color: #9a6700; }
+.badge.draft { background: #eceff3; color: #52606d; }
+.badge.confirmed { background: #dcf5e7; color: #176b3a; }
+.badge.annulled { background: #fdeceb; color: #b42318; }
+
+.source-item {
+  border-left: 3px solid #cbd2d9; background: #fafbfc; padding: 7px 10px;
+  margin: 6px 0; border-radius: 0 6px 6px 0; font-size: 13px;
+}
+.source-item.measurement { border-left-color: #176b3a; }
+.source-item.plan { border-left-color: #1d4f91; }
+.source-item.plan.pending_review { border-left-color: #d97706; }
+.source-doses { margin-top: 3px; color: #52606d; font-size: 12.5px; }
+
+.error { color: #b42318; font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
+#global-message { margin-bottom: 12px; }
+.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13.5px; }
+.flash.error { background: #fdeceb; border: 1px solid #f3c2bd; }
+.flash.success { background: #e8f7ef; border: 1px solid #bfe6cf; color: #176b3a; }
+.flash.warn { background: #fff5e0; border: 1px solid #f2d8a1; color: #9a6700; }
+.flash ul { margin: 6px 0 0 18px; padding: 0; }
+.plan-row-head { font-weight: 600; }
+.mono { font-variant-numeric: tabular-nums; }
+
+/* 计划调整申请 */
+.badge.pending { background: #e0ecff; color: #1d4f91; }
+.badge.withdrawn { background: #eceff3; color: #6b7280; }
+.adj-box {
+  margin-top: 8px; border: 1px solid #c9ddf0; background: #f7faff;
+  border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+}
+.adj-head { font-weight: 600; margin-bottom: 6px; }
+.adj-btns { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.adj-ok { color: #176b3a; background: #e8f7ef; border-radius: 6px; padding: 5px 8px; margin: 6px 0; }
+.adj-conflict { color: #8a2c22; background: #fdeceb; border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+.adj-conflict ul { margin: 4px 0 0 18px; padding: 0; }
+table.diff-table { width: 100%; border-collapse: collapse; margin-top: 4px; font-size: 12px; }
+table.diff-table th, table.diff-table td { border: 1px solid #dde5ee; padding: 4px 7px; text-align: left; }
+table.diff-table th { background: #eef3f8; width: 64px; font-weight: 600; }
+table.diff-table td.changed { background: #fff5e0; color: #9a6700; }
+.ok { color: #176b3a; }
