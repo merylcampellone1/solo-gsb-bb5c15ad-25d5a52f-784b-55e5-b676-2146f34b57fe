@@ -1288,6 +1288,300 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
   };
 }
 
+// ---------------------------------------------------------------------------
+// 联合核准：多条待批准计划一次试算 / 一次批准
+// ---------------------------------------------------------------------------
+
+/** 按 id 批量取计划（动态占位符，兼容内存驱动）。 */
+async function getPlansByIds(client, ids) {
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await client.query(
+    `SELECT * FROM plans WHERE id IN (${placeholders}) ORDER BY id`,
+    ids
+  );
+  return rows;
+}
+
+/**
+ * 联合核准试算（事务内、已持有全部涉及展品行锁后调用）：
+ * 传入按提交顺序排列的计划行，统一核对：
+ *   1) 每条计划仍处于 submitted（待批准；已批准/待复核/驳回/取消都不能进入联合核准）
+ *   2) 组内同展品计划的开灯窗彼此不重叠
+ *   3) 每条计划的开灯窗不与同展品其他已批准/待复核计划重叠
+ *   4) 按现有口径（已确认实测替代估算、本计划停灯扣减）把组内同展品各计划的
+ *      年度残余合并到当前占用（不含组内计划），任一自然年超过年度上限即冲突
+ *      （该年未登记上限同样冲突）
+ * 返回：
+ *   { ok, exhibitIds, items, exhibits, conflicts }
+ * conflicts: {
+ *   notSubmitted: [{planId,status}],
+ *   internalOverlaps: [{planId,otherPlanId}],
+ *   overlappingPlans: [{planId,other:{id,title,status,startDate,endDate}}],
+ *   missingLimits: [{planId,year}],
+ *   overflows: [{exhibitId,year,limit,usedByOthers,groupResidue,
+ *                project,excess,contributions:[{planId,title,residue}]}]
+ * }
+ */
+async function evaluatePlanBatch(client, orderedPlans, nowMs = Date.now()) {
+  void nowMs;
+  const conflicts = {
+    notSubmitted: [],
+    internalOverlaps: [],
+    overlappingPlans: [],
+    missingLimits: [],
+    overflows: [],
+  };
+
+  // 1) 状态核对（只有待批准计划可参与联合核准）
+  for (const plan of orderedPlans) {
+    if (plan.status !== 'submitted') {
+      conflicts.notSubmitted.push({ planId: plan.id, status: plan.status });
+    }
+  }
+
+  const windowsById = new Map();
+  for (const plan of orderedPlans) windowsById.set(Number(plan.id), planWindows(plan));
+
+  // 按展品分组（保持组内顺序）
+  const byExhibit = new Map();
+  for (const plan of orderedPlans) {
+    const exId = Number(plan.exhibit_id);
+    if (!byExhibit.has(exId)) byExhibit.set(exId, []);
+    byExhibit.get(exId).push(plan);
+  }
+
+  // 2) 组内同展品开灯窗两两不重叠（端点相接不算重叠，与既有口径一致）
+  for (const group of byExhibit.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        const a = group[i];
+        const b = group[j];
+        if (anyIntersect(windowsById.get(Number(a.id)), windowsById.get(Number(b.id)))) {
+          conflicts.internalOverlaps.push({
+            planId: a.id,
+            planTitle: a.title,
+            otherPlanId: b.id,
+            otherPlanTitle: b.title,
+          });
+        }
+      }
+    }
+  }
+
+  // 每件展品：当前占用（不含组内计划）、上限、已确认实测窗、停灯视图
+  const occByExhibit = new Map();
+  for (const exId of byExhibit.keys()) {
+    const groupIds = new Set(byExhibit.get(exId).map((p) => Number(p.id)));
+    const occupancy = await computeOccupancy(client, exId, {
+      excludePlanId: null,
+    });
+    // computeOccupancy 只排除单个 id；组内计划均为 submitted，本就不在占用计划中，
+    // 这里再按 id 过滤一次以锁定口径、防御状态差异。
+    const occPlans = occupancy.plans.filter((p) => !groupIds.has(Number(p.id)));
+    const measurements = await getActiveMeasurements(client, exId);
+    const measWindows = measurements.map((m) => ({
+      start: new Date(m.start_ts).getTime(),
+      end: new Date(m.end_ts).getTime(),
+    }));
+    const blackoutView = await loadBlackoutView(client, exId, { confirmedRows: measurements });
+    occByExhibit.set(exId, { occupancy, occPlans, measWindows, blackoutView });
+  }
+
+  // 3) 每条计划不与同展品其他已批准/待复核计划重叠
+  for (const [exId, group] of byExhibit) {
+    const { occPlans } = occByExhibit.get(exId);
+    for (const plan of group) {
+      for (const other of occPlans) {
+        if (anyIntersect(windowsById.get(Number(plan.id)), planWindows(other))) {
+          conflicts.overlappingPlans.push({
+            planId: plan.id,
+            planTitle: plan.title,
+            other: {
+              id: other.id,
+              title: other.title,
+              status: other.status,
+              startDate: dateYmd(other.start_date),
+              endDate: dateYmd(other.end_date),
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // 4) 估算残余合并校验（口径与单条批准/占用查询完全一致）
+  const items = [];
+  const exhibitsReport = [];
+  for (const [exId, group] of byExhibit) {
+    const { occupancy, measWindows, blackoutView } = occByExhibit.get(exId);
+    // 不含组内计划的当前占用（组内均为 submitted，occupancy.used 即“原占用”，防御性重算）
+    const usedByOthers = {};
+    for (const src of occupancy.sources) {
+      if (src.kind === 'plan' && group.some((p) => Number(p.id) === Number(src.id))) continue;
+      addYearDose(usedByOthers, src.yearly);
+    }
+
+    const groupResidueYearly = {};
+    const itemEntries = group.map((plan) => {
+      const windows = windowsById.get(Number(plan.id));
+      const grossYearly = yearMapToObject(doseByYear(windows, Number(plan.estimated_lux)));
+      const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
+      const blackouts = blackoutView.windowsByPlan.get(Number(plan.id)) || [];
+      const remaining = subtractIntervals(windows, [...coverers, ...blackouts]);
+      const residueYearly = yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+      addYearDose(groupResidueYearly, residueYearly);
+      return { plan, windows, grossYearly, residueYearly };
+    });
+
+    for (const entry of itemEntries) {
+      items.push({
+        planId: entry.plan.id,
+        title: entry.plan.title,
+        exhibitId: exId,
+        status: entry.plan.status,
+        startDate: dateYmd(entry.plan.start_date),
+        endDate: dateYmd(entry.plan.end_date),
+        periods: normalizePeriods(entry.plan.light_periods),
+        lux: Number(entry.plan.estimated_lux),
+        grossEstimateYearly: entry.grossYearly,
+        residueYearly: entry.residueYearly,
+        yearly: buildItemYearly(occupancy.limits, usedByOthers, groupResidueYearly, entry),
+      });
+    }
+
+    const yearsSet = new Set([
+      ...Object.keys(occupancy.limits),
+      ...Object.keys(usedByOthers),
+      ...Object.keys(groupResidueYearly),
+    ].map(Number));
+    const yearlyReport = {};
+    for (const year of [...yearsSet].sort((a, b) => a - b)) {
+      const key = String(year);
+      const limit = occupancy.limits[key] !== undefined && occupancy.limits[key] !== null
+        ? round3(occupancy.limits[key]) : null;
+      const otherUsed = round3(usedByOthers[key] || 0);
+      const groupUsed = round3(groupResidueYearly[key] || 0);
+      const projected = round3(otherUsed + groupUsed);
+      const contributions = itemEntries.map((e) => ({
+        planId: e.plan.id,
+        title: e.plan.title,
+        residue: round3(e.residueYearly[key] || 0),
+      })).filter((c) => c.residue > 0);
+      const row = {
+        year,
+        limit,
+        usedByOthers: otherUsed,
+        groupResidue: groupUsed,
+        contributions,
+        projected,
+        remainingAfter: limit === null ? null : round3(limit - projected),
+        excess: null,
+      };
+      if (limit === null) {
+        if (groupUsed > 0) {
+          for (const c of contributions) {
+            conflicts.missingLimits.push({ planId: c.planId, exhibitId: exId, year });
+          }
+        }
+      } else if (projected - limit > 0.005) {
+        row.excess = round3(projected - limit);
+        conflicts.overflows.push({
+          exhibitId: exId,
+          year,
+          limit,
+          usedByOthers: otherUsed,
+          groupResidue: groupUsed,
+          projected,
+          excess: row.excess,
+          contributions,
+        });
+      }
+      yearlyReport[key] = row;
+    }
+    exhibitsReport.push({ exhibitId: exId, yearlyReport });
+  }
+
+  const ok =
+    conflicts.notSubmitted.length === 0 &&
+    conflicts.internalOverlaps.length === 0 &&
+    conflicts.overlappingPlans.length === 0 &&
+    conflicts.missingLimits.length === 0 &&
+    conflicts.overflows.length === 0;
+
+  return { ok, exhibitIds: [...byExhibit.keys()], items, exhibits: exhibitsReport, conflicts };
+}
+
+/** 单条计划视角的按年行：上限 / 原占用 / 本计划新增估算 / 组内合计 / 合并后合计 / 超额。 */
+function buildItemYearly(limits, usedByOthers, groupResidueYearly, entry) {
+  const yearsSet = new Set([
+    ...Object.keys(limits),
+    ...Object.keys(usedByOthers),
+    ...Object.keys(groupResidueYearly),
+    ...Object.keys(entry.residueYearly),
+    ...Object.keys(entry.grossYearly),
+  ].map(Number));
+  const yearly = {};
+  for (const year of [...yearsSet].sort((a, b) => a - b)) {
+    const key = String(year);
+    const limit = limits[key] !== undefined && limits[key] !== null ? round3(limits[key]) : null;
+    const otherUsed = round3(usedByOthers[key] || 0);
+    const groupUsed = round3(groupResidueYearly[key] || 0);
+    const residue = round3(entry.residueYearly[key] || 0);
+    const gross = round3(entry.grossYearly[key] || 0);
+    const projected = round3(otherUsed + groupUsed);
+    yearly[key] = {
+      year,
+      limit,
+      usedByOthers: otherUsed,
+      grossEstimate: gross,
+      addedResidue: residue,
+      groupResidue: groupUsed,
+      projected,
+      remainingAfter: limit === null ? null : round3(limit - projected),
+      excess: limit === null
+        ? null
+        : (projected - limit > 0.005 ? round3(projected - limit) : null),
+      missingLimit: limit === null && residue > 0,
+    };
+  }
+  return yearly;
+}
+
+/** 联合核对失败原因（中文，错误信息与页面共用）。 */
+function batchConflictMessages(evalResult, planTitleById) {
+  const c = evalResult.conflicts;
+  const parts = [];
+  for (const x of c.notSubmitted) {
+    parts.push(`计划 #${x.planId}「${planTitleById.get(x.planId) || ''}」已不是待批准状态（当前：${x.status}）`);
+  }
+  for (const x of c.internalOverlaps) {
+    parts.push(
+      `组内计划「${x.planTitle}」(#${x.planId}) 与「${x.otherPlanTitle}」(#${x.otherPlanId}) 的开灯时间彼此重叠`
+    );
+  }
+  for (const x of c.overlappingPlans) {
+    parts.push(
+      `组内计划「${x.planTitle}」(#${x.planId}) 与同展品${x.other.status === 'pending_review' ? '待复核' : '已批准'}` +
+      `计划「${x.other.title}」(#${x.other.id}) 的开灯时间重叠`
+    );
+  }
+  const missingSeen = new Set();
+  for (const x of c.missingLimits) {
+    const sig = `${x.planId}:${x.year}`;
+    if (missingSeen.has(sig)) continue;
+    missingSeen.add(sig);
+    parts.push(`计划 #${x.planId}「${planTitleById.get(x.planId) || ''}」占用的 ${x.year} 年尚未登记年度额度`);
+  }
+  for (const o of c.overflows) {
+    const contrib = o.contributions.map((ct) => `计划 #${ct.planId} 残余 ${ct.residue}`).join('，');
+    parts.push(
+      `展品 #${o.exhibitId} ${o.year} 年：上限 ${o.limit}，原占用 ${o.usedByOthers}，` +
+        `组内新增残余合计 ${o.groupResidue}（${contrib}），合并后合计 ${o.projected}，超额 ${o.excess} lx·h`
+    );
+  }
+  return parts;
+}
+
 module.exports = {
   ACTIVE_PLAN_STATUSES,
   lockExhibit,
@@ -1319,4 +1613,8 @@ module.exports = {
   evaluateAdjustmentPair,
   decoratePlans,
   serializeAdjustment,
+  // 联合核准
+  getPlansByIds,
+  evaluatePlanBatch,
+  batchConflictMessages,
 };

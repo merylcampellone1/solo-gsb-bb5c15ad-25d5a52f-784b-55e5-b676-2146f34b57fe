@@ -7,6 +7,8 @@
  *       实测替代估算、重叠实测拒绝、迟到实测转待复核与复核重新校验、
  *       计划调整申请的提交/撤回/驳回/批准、待审占用、原值拟改值、冲突计划/实测/超额年份核对、
  *       成对核准（互换档期、组成性拒绝、试算/提交、失败原子性、各计划贡献超额）、
+ *       联合核准（2~10 条待批准计划：组内重叠/外部重叠、年度残余合并超额、未登记上限、
+ *                 状态与实时占用重核、失败整组不变、逐条+汇总审计、跨展品组）、
  *       下调年度上限的预演/凭证提交、占用变化拒绝并返回新结果、旧接口同事务即时重算、
  *       未开始计划转待复核（写明原因）、已开始计划保留且超额如实显示。
  */
@@ -30,6 +32,7 @@ dbModule.pool.query = (...args) => fakePool.query(...args);
 const { createApp } = require('../src/app');
 const { initializeDatabase } = require('../src/init');
 const config = require('../src/config');
+const dosing = require('../src/dosing');
 
 let server;
 let base;
@@ -1065,6 +1068,244 @@ async function runFlow() {
     '含窗外实测的成对核准被拒并指出实测');
   r = await call('GET', `/api/adjustments/${adjN}`, null, 'i');
   assert(r.body.adjustment.status === 'pending', '失败后合规一方的申请也仍待审');
+
+  // =======================================================================
+  // 联合核准（布展员/保管员试算，保管员一次批准 2~10 条待批准计划）
+  // =======================================================================
+  const exBatch = await createExhibit('联合核准展品');
+  await call('POST', `/api/exhibits/${exBatch}/limits`, { year: 2040, limitLxh: 5000 }, 'c');
+  await call('POST', `/api/exhibits/${exBatch}/limits`, { year: 2041, limitLxh: 5000 }, 'c');
+
+  // b1: 2040-01-10 09-17 100lx = 800；b2: 2040-01-11 夜场 18-22 = 400
+  // b3: 2040-01-12 09-17 = 800；b4: 2040-01-13（将与 b1 同窗的外部已批准计划冲突）
+  const b1 = await submitPlan(exBatch, '联合计划1', '2040-01-10', '2040-01-10',
+    ['09:00-17:00'], 100);
+  const b2 = await submitPlan(exBatch, '联合计划2', '2040-01-11', '2040-01-11',
+    ['18:00-22:00'], 100);
+  const b3 = await submitPlan(exBatch, '联合计划3（跨年）', '2040-12-31', '2041-01-01',
+    ['09:00-17:00'], 100); // 800 + 800
+  const b4 = await submitPlan(exBatch, '联合计划4', '2040-01-13', '2040-01-13',
+    ['09:00-17:00'], 100);
+
+  // ---- 组成性校验：数量 / 重复 / 非整数 / 不存在 ----
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1] }, 'i');
+  assert(r.status === 400 && /2 至 10/.test(r.body.error), '少于 2 条被拒绝');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b1] }, 'i');
+  assert(r.status === 400 && /互不相同/.test(r.body.error), '重复编号被拒绝');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, 'x'] }, 'i');
+  assert(r.status === 400 && /正整数/.test(r.body.error), '非整数编号被拒绝');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, 999999] }, 'i');
+  assert(r.status === 400 && /不存在/.test(r.body.error), '不存在的计划被拒绝');
+  r = await call('POST', '/api/plans/batch/preview',
+    { planIds: [b1, b2, b3, b4, b1, b2, b3, b4, b1, b2, b3] }, 'i');
+  assert(r.status === 400, '超过 10 条被拒绝');
+
+  // ---- 试算通过：逐条计划 + 各年原占用/新增/上限/合并 ----
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b2, b3, b4] }, 'i');
+  assert(r.status === 200 && r.body.batchPreview, '布展员可联合试算');
+  let bp = r.body.batchPreview;
+  assert(bp.ok === true, '四条互不重叠计划试算通过');
+  assert(bp.plans.length === 4, '列出每条计划');
+  const item1 = bp.plans.find((p) => p.id === b1);
+  assert(item1.batch.residueYearly['2040'] === 800,
+    '计划1 2040 新增残余 800');
+  const item3 = bp.plans.find((p) => p.id === b3);
+  assert(item3.batch.residueYearly['2040'] === 800 && item3.batch.residueYearly['2041'] === 800,
+    '跨年计划按年列出新增残余');
+  assert(item1.batch.yearly['2040'].limit === 5000 &&
+    item1.batch.yearly['2040'].usedByOthers === 0,
+    '逐条年度行含上限与原占用');
+  const bRep = bp.exhibits.find((e) => e.exhibitId === exBatch).yearlyReport;
+  assert(bRep['2040'].groupResidue === 2800 && bRep['2040'].projected === 2800 &&
+    bRep['2041'].groupResidue === 800,
+    `按展品合并年度残余：2040=2800（800+400+800+800），2041=800，实际 ${JSON.stringify(bRep)}`);
+  assert(bRep['2040'].contributions.length === 4, '超额/合并行列出各计划贡献');
+
+  // 保管员同样可以试算
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b2] }, 'c');
+  assert(r.status === 200 && r.body.batchPreview.ok === true, '保管员可联合试算');
+
+  // ---- 组内同展品开灯窗彼此重叠 ----
+  // b5 与 b1 同日同时段（提交允许，因为组外的 b1 仍为 submitted 不占用排期）
+  const b5 = await submitPlan(exBatch, '联合计划5（撞1）', '2040-01-10', '2040-01-10',
+    ['10:00-11:00'], 100);
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b5] }, 'i');
+  assert(r.status === 200 && r.body.batchPreview.ok === false, '组内重叠试算标记不通过');
+  assert(r.body.batchPreview.conflicts.internalOverlaps.some(
+    (x) => x.planId === b1 && x.otherPlanId === b5),
+    '结构化冲突指出组内重叠的一对计划');
+  const f1 = r.body.batchPreview.plans.find((p) => p.id === b1);
+  assert(f1.batch.conflicts.internalOverlaps.some((x) => x.otherPlanId === b5),
+    '逐条计划带组内冲突标记');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b5] }, 'c');
+  assert(r.status === 409 && /彼此重叠/.test(r.body.error), '组内重叠联合核准被拒（409）');
+
+  // ---- 与其他已批准/待复核计划重叠：b6 先与 b4 同窗提交（均 submitted 不拦截），再批准 b4 后组批 ----
+  const b6 = await submitPlan(exBatch, '联合计划6（撞已批准）', '2040-01-13', '2040-01-13',
+    ['12:00-13:00'], 100);
+  await approvePlan(b4);
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b6] }, 'i');
+  assert(r.body.batchPreview.conflicts.overlappingPlans.some(
+    (x) => x.planId === b6 && x.other.id === b4),
+    '试算指出与已批准计划 b4 重叠');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b6] }, 'c');
+  assert(r.status === 409 && /联合计划4/.test(r.body.error), '外部重叠联合核准被拒并指出冲突计划');
+
+  // ---- 上限超额：2040 合并残余超限时整组拒绝 ----
+  await call('POST', `/api/exhibits/${exBatch}/limits`, { year: 2040, limitLxh: 2000 }, 'c');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [b1, b2, b3] }, 'c');
+  assert(r.status === 200 && r.body.batchPreview.ok === false, '超额试算不通过');
+  const bo = r.body.batchPreview.conflicts.overflows.find((o) => o.year === 2040);
+  assert(bo && bo.limit === 2000 && bo.groupResidue === 2000 && bo.projected === 2800 &&
+    bo.excess === 800, `2040 超额 800：${JSON.stringify(bo)}`);
+  assert(bo.contributions.some((ct) => ct.planId === b1 && ct.residue === 800) &&
+    bo.contributions.some((ct) => ct.planId === b3 && ct.residue === 800),
+    '超额行列出各计划按年贡献');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b2, b3] }, 'c');
+  assert(r.status === 409 && /2040 年/.test(r.body.error) && /超额 800/.test(r.body.error),
+    '超额联合核准被拒并指出年份与超额量');
+  // 提额后可批
+  await call('POST', `/api/exhibits/${exBatch}/limits`, { year: 2040, limitLxh: 5000 }, 'c');
+
+  // ---- 未登记上限的年份：只登记 2042 上限的展品，跨年计划组批报缺失年份 ----
+  const exBatch2 = await createExhibit('联合核准展品2');
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2042, limitLxh: 5000 }, 'c');
+  const c1 = await submitPlan(exBatch2, '缺额跨年计划', '2042-12-31', '2043-01-01',
+    ['09:00-17:00'], 100);
+  const c2 = await submitPlan(exBatch2, '缺额同年计划', '2042-06-01', '2042-06-01',
+    ['09:00-17:00'], 100);
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [c1, c2] }, 'i');
+  assert(r.body.batchPreview.conflicts.missingLimits.some(
+    (x) => x.planId === c1 && x.year === 2043),
+    '试算指出 2043 年未登记额度');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [c1, c2] }, 'c');
+  assert(r.status === 409 && /2043/.test(r.body.error), '未登记年份联合核准被拒');
+
+  // ---- 失败不变：被拒后组内计划仍为 submitted，占用不含它们，审计无联合核准记录 ----
+  r = await call('GET', `/api/exhibits/${exBatch}`, null, 'i');
+  assert([b1, b2, b3].every((pid) =>
+    r.body.plans.find((p) => p.id === pid).status === 'submitted'),
+    '核对失败后组内计划仍待批准');
+  assert(!r.body.sources.some((s) => s.kind === 'plan' && [b1, b2, b3].includes(s.id)),
+    '失败后待批准计划不占额度');
+
+  // ---- 状态重核：试算后其中一条被单条批准/驳回/取消，提交时整组拒绝 ----
+  await call('POST', `/api/plans/${b2}/reject`, {}, 'c');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b2, b3] }, 'c');
+  assert(r.status === 409 && r.body.details.conflicts.notSubmitted.some(
+    (x) => x.planId === b2 && x.status === 'rejected'),
+    '提交时重新核对计划状态：已驳回的导致整组 409');
+  // 重新提交一条待批准计划替代 b2
+  const b2b = await submitPlan(exBatch, '联合计划2b', '2040-01-11', '2040-01-11',
+    ['18:00-22:00'], 100);
+
+  // ---- 布展员不能提交联合核准 ----
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b2b, b3] }, 'i');
+  assert(r.status === 403, '布展员不能提交联合核准');
+
+  // ---- 成功：一次批准三条；成功响应为展品详情（兼容），另附 batchApproval ----
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b2b, b3] }, 'c');
+  assert(r.status === 200, `联合核准成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  assert(r.body.exhibit && r.body.years && r.body.plans,
+    '单展品成功响应仍为展品详情（兼容）');
+  assert(r.body.batchApproval && r.body.batchApproval.planIds.join(',') === [b1, b2b, b3].join(','),
+    '成功响应附带 batchApproval');
+  assert(r.body.years['2040'].used === 2800 && r.body.years['2041'].used === 800,
+    `批准后 2040 占用 2800（b4 800 + b1 800 + b2b 400 + b3 800）、2041=800，实际 ${r.body.years['2040'].used}`);
+  for (const pid of [b1, b2b, b3]) {
+    const row = r.body.plans.find((p) => p.id === pid);
+    assert(row.status === 'approved' && row.approved_by != null,
+      `计划 #${pid} 已一次批准且保留审批人`);
+  }
+
+  // 审计：逐条 + 汇总
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.some((e) => e.action === 'plan.batch_approve'),
+    '审计记录联合核准汇总事件');
+  const itemAudits = r.body.events.filter((e) => e.action === 'plan.batch_approve_item');
+  assert(itemAudits.map((e) => Number(e.target_id)).sort((a, b) => a - b)
+    .join(',') === [b1, b2b, b3].sort((a, b) => a - b).join(','),
+    '审计逐条记录组内每条计划的批准');
+
+  // 已批准计划再次组批 -> notSubmitted
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [b1, b4] }, 'c');
+  assert(r.status === 409 && r.body.details.conflicts.notSubmitted.length === 2,
+    '已批准计划不能再次参与联合核准');
+
+  // ---- 实时占用重核：试算通过后并发改动额度/占用，提交返回最新冲突（整组不变）----
+  const bd1 = await submitPlan(exBatch2, '重核计划1', '2042-02-01', '2042-02-01',
+    ['09:00-17:00'], 100); // 800
+  const bd2 = await submitPlan(exBatch2, '重核计划2', '2042-03-01', '2042-03-01',
+    ['09:00-17:00'], 100); // 800
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2043, limitLxh: 5000 }, 'c');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [c1, c2, bd1, bd2] }, 'c');
+  assert(r.status === 200 && r.body.batchPreview.ok === true, '补登记额度后试算通过');
+  // 试算后把 2042 上限下调到仅 800（无未开始计划转复核影响本批，因本批仍 submitted）
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2042, limitLxh: 800 }, 'c');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [c1, c2, bd1, bd2] }, 'c');
+  assert(r.status === 409, '提交时实时重算占用：额度已下调，整组被拒');
+  // 此时 c2 仍待批准：原占用 0，组内 4 条 2042 残余各 800 = 3200，超额 2400
+  const do2042 = r.body.details.conflicts.overflows.find((o) => o.year === 2042);
+  assert(do2042 && do2042.limit === 800 && do2042.groupResidue === 3200 && do2042.excess === 2400,
+    `409 明细为最新额度下的核算（800/3200）：${JSON.stringify(do2042)}`);
+
+  // ---- 停灯扣减口径进入合并校验：先恢复额度并批准两条，再预置停灯后组批 ----
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2042, limitLxh: 5000 }, 'c');
+  // 批准 c2（2042-06-01 09-17，800）作为已占用基线
+  r = await call('POST', `/api/plans/${c2}/approve`, {}, 'c');
+  assert(r.status === 200, '单条批准 c2 作为占用基线');
+  // 给 c2 预置停灯 2042-06-01 10:00-12:00（2h×100=200），其残余变 600
+  await dbModule.withTransaction(async (client) => {
+    const exRow = await client.query('SELECT exhibit_id FROM plans WHERE id = $1', [c2]);
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [c2, exRow.rows[0].exhibit_id,
+        new Date(dosing.wallToTs('2042-06-01', 600)),
+        new Date(dosing.wallToTs('2042-06-01', 720)),
+        '联合核准前停灯']
+    );
+  });
+  // 上限 1400：原占用 c2 残余 600 + 组内 c1(2042 部分 800)+bd1(800)+bd2(800)=2400 → 超 1600；
+  // 若漏扣停灯（原占用按 800）超额会是 1800
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2042, limitLxh: 1400 }, 'c');
+  r = await call('POST', '/api/plans/batch/preview', { planIds: [c1, bd1, bd2] }, 'c');
+  const bkOverflow = r.body.batchPreview.conflicts.overflows.find((o) => o.year === 2042);
+  assert(bkOverflow && bkOverflow.usedByOthers === 600 && bkOverflow.excess === 1600,
+    `合并校验原占用含停灯扣减（600），超额 1600：${JSON.stringify(bkOverflow)}`);
+
+  // ---- 跨展品联合核准：一次锁多件展品，全部通过才一起批准 ----
+  const exCross = await createExhibit('联合核准跨展品');
+  await call('POST', `/api/exhibits/${exCross}/limits`, { year: 2044, limitLxh: 5000 }, 'c');
+  const x1 = await submitPlan(exCross, '跨展品计划X', '2044-05-01', '2044-05-01',
+    ['09:00-17:00'], 100);
+  await call('POST', `/api/exhibits/${exBatch2}/limits`, { year: 2042, limitLxh: 5000 }, 'c');
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [c1, bd1, bd2, x1] }, 'c');
+  assert(r.status === 200, `跨展品联合核准成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  assert(r.body.exhibitDetails && r.body.exhibitDetails.length === 2,
+    '跨展品成功响应返回各展品详情');
+  assert(r.body.batchApproval.exhibitIds.sort((a, b) => a - b)
+    .join(',') === [exBatch2, exCross].sort((a, b) => a - b).join(','),
+    'batchApproval 标注涉及展品');
+  r = await call('GET', `/api/exhibits/${exCross}`, null, 'i');
+  assert(r.body.years['2044'].used === 800 &&
+    r.body.plans.find((p) => p.id === x1).status === 'approved',
+    '跨展品组内计划同时批准');
+  r = await call('GET', `/api/exhibits/${exBatch2}`, null, 'i');
+  assert([c1, bd1, bd2].every((pid) =>
+    r.body.plans.find((p) => p.id === pid).status === 'approved'),
+    '跨展品组另一展品的计划也已批准');
+
+  // ---- 跨展品组中一件展品冲突：整组（含另一件展品）不变 ----
+  const y1 = await submitPlan(exCross, '跨展品冲突Y', '2044-06-01', '2044-06-01',
+    ['09:00-17:00'], 100);
+  const y2 = await submitPlan(exBatch2, '缺额年计划Y2', '2050-01-01', '2050-01-01',
+    ['09:00-17:00'], 100); // 2050 无上限
+  r = await call('POST', '/api/plans/batch/approve', { planIds: [y1, y2] }, 'c');
+  assert(r.status === 409 && /2050/.test(r.body.error), '跨展品组一件冲突整组被拒');
+  r = await call('GET', `/api/exhibits/${exCross}`, null, 'i');
+  assert(r.body.plans.find((p) => p.id === y1).status === 'submitted',
+    '跨展品失败后无冲突展品的计划也保持待批准');
 
   // =======================================================================
   // 停灯（blackout）登记：保管员登记已发生停灯时段，仅扣估算、不动实测/排期

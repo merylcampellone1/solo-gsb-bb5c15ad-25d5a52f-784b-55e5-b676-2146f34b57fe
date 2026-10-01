@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { query, withExhibitTransaction } = require('../db');
+const { query, withExhibitTransaction, withExhibitsTransaction } = require('../db');
 const { requireRole, requireAuth } = require('../auth');
 const { recordAudit } = require('../audit');
 const {
@@ -11,6 +11,7 @@ const {
 const {
   lockExhibit,
   getPlan,
+  getPlansByIds,
   getOccupyingPlans,
   planWindows,
   computeOccupancy,
@@ -18,6 +19,8 @@ const {
   planOverlaps,
   decoratePlans,
   normalizeScheduleInput,
+  evaluatePlanBatch,
+  batchConflictMessages,
 } = require('../service');
 const {
   doseByYear,
@@ -113,6 +116,218 @@ router.post('/', requireRole('installer'), async (req, res, next) => {
 function buildWindowsSafe(input) {
   return buildWindows(input.startDate, input.endDate, input.periods);
 }
+
+// ---------------------------------------------------------------------------
+// 联合核准：按编号选取 2~10 条不同的待批准计划，整组同时试算 / 一次批准
+// 注意：必须注册在 '/:id' 之前，否则 '/batch/preview' 会被 ':id' 捕获。
+// ---------------------------------------------------------------------------
+
+/** 解析联合核准请求体：planIds 数组、2~10 个互不相同的正整数，返回按输入顺序的编号。 */
+function parseBatchIds(body) {
+  const raw = body && Array.isArray(body.planIds) ? body.planIds : null;
+  if (!raw || raw.length < 2 || raw.length > 10) {
+    throw new ValidationError('请选择 2 至 10 条不同的待批准计划（planIds 数组）');
+  }
+  const ids = raw.map(Number);
+  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) {
+    throw new ValidationError('计划编号必须是正整数');
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new ValidationError('联合核准的计划编号必须互不相同');
+  }
+  return ids;
+}
+
+/**
+ * 按输入顺序装配计划行（缺失即 400）。q 为查询函数或事务 client。
+ * 同时返回 planTitleById 供中文错误信息使用。
+ */
+async function loadOrderedPlans(q, ids) {
+  const run = typeof q === 'function' ? q : q.query.bind(q);
+  const rows = await getPlansByIds({ query: run }, ids);
+  const byId = new Map(rows.map((p) => [Number(p.id), p]));
+  const ordered = [];
+  for (const id of ids) {
+    const plan = byId.get(id);
+    if (!plan) throw new ValidationError(`计划 #${id} 不存在`);
+    ordered.push(plan);
+  }
+  return ordered;
+}
+
+/** 联合试算对外形态：展品名 + 每条计划（含按年新增/原占用/上限/冲突标记）+ 按展品年度合并报告。 */
+async function buildBatchPayload(client, ids, orderedPlans, evalResult) {
+  const exhibitIds = [...new Set(orderedPlans.map((p) => Number(p.exhibit_id)))];
+  let exhibitNameById = new Map();
+  if (exhibitIds.length > 0) {
+    const ph = exhibitIds.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await client.query(`SELECT id, name FROM exhibits WHERE id IN (${ph})`, exhibitIds);
+    exhibitNameById = new Map(rows.map((e) => [Number(e.id), e.name]));
+  }
+  const itemById = new Map(evalResult.items.map((it) => [Number(it.planId), it]));
+
+  const plans = orderedPlans.map((plan) => {
+    const item = itemById.get(Number(plan.id)) || {};
+    return {
+      ...plan,
+      not_started: plan.status === 'approved',
+      notStarted: plan.status === 'approved',
+      pending_adjustment: null,
+      pendingAdjustment: null,
+      batch: {
+        grossEstimateYearly: item.grossEstimateYearly || {},
+        residueYearly: item.residueYearly || {},
+        yearly: item.yearly || {},
+        conflicts: planConflictFlags(evalResult, Number(plan.id)),
+      },
+    };
+  });
+
+  const exhibits = evalResult.exhibits.map((rep) => ({
+    exhibitId: rep.exhibitId,
+    exhibitName: exhibitNameById.get(Number(rep.exhibitId)) || null,
+    yearlyReport: rep.yearlyReport,
+  }));
+
+  return {
+    planIds: ids,
+    ok: evalResult.ok,
+    conflicts: evalResult.conflicts,
+    plans,
+    exhibits,
+  };
+}
+
+/** 汇总单条计划涉及的全部冲突（供试算结果逐计划展示）。 */
+function planConflictFlags(evalResult, planId) {
+  const c = evalResult.conflicts;
+  return {
+    notSubmitted: c.notSubmitted.some((x) => Number(x.planId) === planId)
+      ? (c.notSubmitted.find((x) => Number(x.planId) === planId) || {}).status
+      : null,
+    internalOverlaps: c.internalOverlaps
+      .filter((x) => Number(x.planId) === planId || Number(x.otherPlanId) === planId)
+      .map((x) => (Number(x.planId) === planId
+        ? { otherPlanId: x.otherPlanId, otherPlanTitle: x.otherPlanTitle }
+        : { otherPlanId: x.planId, otherPlanTitle: x.planTitle })),
+    overlappingPlans: c.overlappingPlans
+      .filter((x) => Number(x.planId) === planId)
+      .map((x) => x.other),
+    missingLimitYears: c.missingLimits
+      .filter((x) => Number(x.planId) === planId)
+      .map((x) => x.year),
+    overflowYears: c.overflows
+      .filter((o) => o.contributions.some((ct) => Number(ct.planId) === planId))
+      .map((o) => o.year),
+  };
+}
+
+/**
+ * 联合试算（布展员与保管员均可）：不写库。
+ * 组内同展品开灯窗彼此不重叠、且不与其他已批准/待复核计划重叠；
+ * 按自然年合并组内同展品各计划估算残余（实测替代估算、停灯扣减口径）校验上限。
+ */
+router.post('/batch/preview', requireAuth, async (req, res, next) => {
+  try {
+    const ids = parseBatchIds(req.body || {});
+    const prePlans = await loadOrderedPlans(query, ids);
+    const exhibitIds = [...new Set(prePlans.map((p) => Number(p.exhibit_id)))];
+    const result = await withExhibitsTransaction(exhibitIds, async (client) => {
+      const orderedPlans = await loadOrderedPlans(client, ids);
+      const evalResult = await evaluatePlanBatch(client, orderedPlans);
+      return buildBatchPayload(client, ids, orderedPlans, evalResult);
+    });
+    res.json({ batchPreview: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * 联合核准提交（仅保管员）：在涉及展品的锁事务内重新核对计划状态与实时占用，
+ * 全部通过才一次把组内计划全部批准并逐条 + 汇总记录审计；
+ * 任一失败则事务回滚，组内计划与审计均不变，409 返回涉及的计划、年份与冲突原因。
+ * 单展品时成功响应与既有单条批准同构（展品详情字段位于顶层，另附 batchApproval）。
+ */
+router.post('/batch/approve', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const ids = parseBatchIds(req.body || {});
+    const prePlans = await loadOrderedPlans(query, ids);
+    const exhibitIds = [...new Set(prePlans.map((p) => Number(p.exhibit_id)))];
+
+    const detail = await withExhibitsTransaction(exhibitIds, async (client) => {
+      // 锁内重读：状态/占用可能在预检后被并发改动
+      const orderedPlans = await loadOrderedPlans(client, ids);
+      const evalResult = await evaluatePlanBatch(client, orderedPlans);
+      if (!evalResult.ok) {
+        const titleById = new Map(orderedPlans.map((p) => [Number(p.id), p.title]));
+        throw new ConflictError(
+          `联合核准（计划 ${ids.map((id) => `#${id}`).join('、')}）未通过核对：` +
+            batchConflictMessages(evalResult, titleById).join('；'),
+          {
+            planIds: ids,
+            conflicts: evalResult.conflicts,
+            items: evalResult.items,
+            exhibits: evalResult.exhibits,
+          }
+        );
+      }
+
+      // 全部通过：一次批准组内全部计划（同一事务）
+      const residueByPlan = new Map(evalResult.items.map((it) => [Number(it.planId), it.residueYearly]));
+      for (const plan of orderedPlans) {
+        await client.query(
+          `UPDATE plans
+              SET status = 'approved', approved_by = $1, approved_at = now(),
+                  review_reason = NULL, updated_at = now()
+            WHERE id = $2 AND status = 'submitted'`,
+          [req.sessionUser.userId, plan.id]
+        );
+        await recordAudit(client, req.sessionUser, 'plan.batch_approve_item',
+          'plan', plan.id, {
+            exhibitId: Number(plan.exhibit_id),
+            batchPlanIds: ids,
+            addedYearly: residueByPlan.get(Number(plan.id)) || {},
+          });
+      }
+      await recordAudit(client, req.sessionUser, 'plan.batch_approve',
+        'plan', orderedPlans[0].id, {
+          planIds: ids,
+          exhibitIds,
+          items: evalResult.items.map((it) => ({
+            planId: it.planId, exhibitId: it.exhibitId, residueYearly: it.residueYearly,
+          })),
+          yearlyByExhibit: evalResult.exhibits.map((rep) => ({
+            exhibitId: rep.exhibitId,
+            yearly: rep.yearlyReport,
+          })),
+        });
+
+      const batchApproval = {
+        planIds: ids,
+        exhibitIds,
+        items: evalResult.items,
+        exhibits: evalResult.exhibits,
+      };
+
+      // 成功响应：单展品时与既有单条批准同构（展品详情顶层字段保持兼容）
+      if (exhibitIds.length === 1) {
+        const detailAfter = await exhibitDetail(client, exhibitIds[0], { lock: true });
+        return { ...detailAfter, batchApproval };
+      }
+      // 跨展品：返回各展品最新详情（既有单展品字段不适用，不新增顶层展品详情字段）
+      const details = [];
+      for (const exId of exhibitIds) {
+        details.push(await exhibitDetail(client, exId, { lock: true }));
+      }
+      return { ok: true, batchApproval, exhibitDetails: details };
+    });
+
+    res.json(detail);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // 计划详情
 router.get('/:id', async (req, res, next) => {

@@ -62,6 +62,20 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       （估算残余 = 开灯窗 − 已确认实测覆盖 − 本计划停灯）；调整/成对核准还要求**既有停灯仍落在拟改新窗内**。
     - 后续实测**录入或确认碰到停灯时段一律拒绝**。展品详情展示全部停灯记录及**各年扣减量**，
       既有查询字段保持兼容（仅附加新字段）。
+14. **联合核准（整组一次批准 2~10 条待批准计划）**：布展员和保管员均可**试算**，仅保管员可**提交联合核准**。
+    - 按编号选择 **2 至 10 条不同的待批准（submitted）计划**（可跨展品）；试算逐计划列出
+      **展品、各自然年新增估算占用（毛估算与扣减后残余）、原占用、上限、合并后合计及该计划的冲突标记**，
+      并按展品给出年度合并报告（各计划残余贡献、合计、超额量）。
+    - **组内同展品计划的开灯窗须彼此不重叠**，且**分别不与其他已批准或待复核计划重叠**
+      （端点相接不算重叠；不同展品的计划互不相干）。
+    - 年度残余按**现有统一口径**合并：已确认实测替代估算、本计划停灯扣减，即
+      估算残余 = 开灯窗 − 已确认实测覆盖 − 本计划停灯；把组内同展品各计划的年度残余并入
+      **不含组内计划的当前占用**，任一自然年超过年度上限（或该年未登记上限）即冲突。
+    - 提交时在涉及展品的锁事务内（跨展品按展品 id 升序加锁）**重新核对计划状态与实时占用**：
+      **全部通过才一次批准整组并逐条 + 汇总记录审计**；任一失败则**整组计划与审计均不变**，
+      返回 409，结构化指出涉及的**计划、年份与冲突原因**（组内重叠/外部重叠/状态已变/未登记上限/超额）。
+    - 单展品成功响应与既有单条批准同构（展品详情字段位于顶层，另附 `batchApproval`）；
+      跨展品成功时返回各展品最新详情。**既有单条审批与展品详情响应保持兼容。**
 
 ## 一键启动（Docker Compose）
 
@@ -151,8 +165,13 @@ npm run test:utils
    填写已发生的起止时刻与**必填原因**后登记：系统校验起止顺序、结束不晚于当前、完整落在开灯窗内、
    不与未作废实测或其他停灯相交；通过后该时段按计划预计照度从估算中按自然年扣减（不减已确认实测、
    不释放排期）。停灯记录保留、不可改删，布展员只读；之后录入/确认碰到该时段的实测会被拒绝。
+10. 一个布展场次涉及多条计划时，布展员或保管员在「布展计划」按编号勾选 **2~10 条不同的待批准计划**
+    做**联合试算**：逐条查看展品与各自然年新增估算、原占用、上限、合并后合计及冲突（组内开灯窗彼此重叠、
+    与其他已批准/待复核计划重叠、超额/未登记上限）；确认无误后由保管员**提交联合核准**：
+    系统在锁事务内重新核对计划状态与实时占用，全部通过才一次批准整组（逐条 + 汇总留痕），
+    任一失败整组计划与审计均不变，并返回涉及的计划、年份与冲突原因。
 
-## HTTP API（含计划调整申请、成对核准、年度上限下调预演、停灯登记）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -182,6 +201,8 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET  /api/plans?exhibitId=` | 登录 | 计划列表（附加 `notStarted`、`pendingAdjustment` 概要） |
 | `POST /api/plans` | 布展员 | 创建计划 |
 | `GET  /api/plans/:id` | 登录 | 计划详情（待审申请带 `preview` 原值/拟改值试算） |
+| `POST /api/plans/batch/preview` | 登录 | **联合试算**：2~10 条不同待批准计划的整组核对，不写库（布展员/保管员均可） |
+| `POST /api/plans/batch/approve` | 保管员 | **联合核准**：锁事务内重核，全部通过才一次批准整组并记审计；任一失败整组不变（409） |
 | `POST /api/plans/:id/approve` | 保管员 | 批准 / 复核通过 |
 | `POST /api/plans/:id/reject` | 保管员 | 驳回落计划 |
 | `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
@@ -362,6 +383,97 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/pair
 成功响应与单份批准同构（展品详情字段位于顶层），另附 `pairApproval`
 （`adjustmentIds`/`planIds`/`items`/`yearlyReport`）。单份审批与既有查询接口的字段和行为不变。
 
+### 联合核准 `/api/plans/batch/*`（布展员/保管员试算，保管员提交）
+
+一个布展场次涉及多条计划时，按编号选择 **2 至 10 条不同的待批准计划**（`submitted`，可跨展品），
+整组同时试算 / 一次批准。请求体均为：
+
+```json
+{ "planIds": [12, 13, 14] }
+```
+
+组成性拒绝（**400**，试算与提交一致）：不是数组 / 少于 2 条或多于 10 条 / 编号重复 / 编号非正整数 /
+计划不存在；布展员调用提交接口 → 403（试算接口布展员可用）。
+
+试算 `POST /api/plans/batch/preview` **不写库**，返回 `batchPreview`：
+
+- `plans[]`：每条计划的展品、展期、开灯时段、预计照度，以及内联 `batch`：
+  - `grossEstimateYearly`：各自然年**新增毛估算占用**（开灯窗 × 预计照度）；
+  - `residueYearly`：按统一口径扣减后的**新增估算残余**（= 开灯窗 − 已确认实测覆盖 − 本计划停灯）；
+  - `yearly`：该计划涉及每个年份的 `limit` 上限、`usedByOthers` 原占用（不含组内计划）、
+    `grossEstimate` 毛估算、`addedResidue` 新增残余、`groupResidue` 组内同展品残余合计、
+    `projected` 合并后合计、`remainingAfter` 剩余、`excess` 超额量、`missingLimit`；
+  - `conflicts`：该计划自身的冲突标记（`notSubmitted` / `internalOverlaps` /
+    `overlappingPlans` / `missingLimitYears` / `overflowYears`）。
+- `exhibits[]`：按展品合并的年度报告 `yearlyReport`（上限、原占用、组内残余合计、
+  各计划 `contributions` 贡献、合并后合计、剩余、超额）。
+- 顶层 `ok` 与 `conflicts`：`notSubmitted` / `internalOverlaps`（组内同展品彼此重叠）/
+  `overlappingPlans`（与其他已批准/待复核计划重叠）/ `missingLimits` / `overflows`。
+
+```bash
+# 1) 布展员（或保管员）整组试算：不写库
+curl -b cookies.txt -X POST http://localhost:3000/api/plans/batch/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"planIds":[12,13,14]}'
+
+# 2) 保管员提交联合核准
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/plans/batch/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"planIds":[12,13,14]}'
+```
+
+提交在涉及展品的锁事务内（跨展品按展品 id 升序加锁，与单条审批互斥）**重新核对计划状态与实时占用**。
+单展品成功响应与单条批准同构（展品详情字段位于顶层，保持兼容），另附：
+
+```json
+{
+  "exhibit": { }, "years": { }, "sources": [ ], "plans": [ ], "measurements": [ ],
+  "batchApproval": {
+    "planIds": [12, 13, 14],
+    "exhibitIds": [3],
+    "items": [
+      { "planId": 12, "title": "计划A", "exhibitId": 3,
+        "grossEstimateYearly": { "2030": 800 },
+        "residueYearly": { "2030": 800 }, "yearly": { } }
+    ],
+    "exhibits": [ { "exhibitId": 3, "yearlyReport": { "2030": { } } } ]
+  }
+}
+```
+
+跨展品成功时无顶层展品详情字段，返回 `{ "ok": true, "batchApproval": { }, "exhibitDetails": [ …各展品详情 ] }`。
+审计写入一条汇总事件 `plan.batch_approve` 与组内逐条 `plan.batch_approve_item`。
+
+任一核对失败返回 **409**，事务回滚，**整组计划与审计均不变**，`details` 指明涉及的计划、年份与全部冲突：
+
+```json
+{
+  "error": "联合核准（计划 #12、#13）未通过核对：组内计划「计划A」(#12) 与「计划B」(#13) 的开灯时间彼此重叠；展品 #3 2030 年：上限 2000，原占用 800，组内新增残余合计 1600（计划 #12 残余 800，计划 #13 残余 800），合并后合计 2400，超额 400 lx·h",
+  "details": {
+    "planIds": [12, 13],
+    "conflicts": {
+      "notSubmitted": [],
+      "internalOverlaps": [{ "planId": 12, "planTitle": "计划A", "otherPlanId": 13, "otherPlanTitle": "计划B" }],
+      "overlappingPlans": [],
+      "missingLimits": [],
+      "overflows": [{
+        "exhibitId": 3, "year": 2030, "limit": 2000, "usedByOthers": 800,
+        "groupResidue": 1600, "projected": 2400, "excess": 400,
+        "contributions": [
+          { "planId": 12, "title": "计划A", "residue": 800 },
+          { "planId": 13, "title": "计划B", "residue": 800 }
+        ]
+      }]
+    },
+    "items": [ "每条计划的毛估算/残余按年" ],
+    "exhibits": [ "每件展品的年度合并报告" ]
+  }
+}
+```
+
+核对口径与单条批准完全一致：已确认实测替代估算、本计划停灯从估算残余扣减（不减实测、不释放排期）；
+试算后若计划被单条批准/驳回/取消、额度调整、实测确认、新增占用等，提交会按最新状态/实时占用重新拒绝。
+
 ### 下调年度上限 `/api/exhibits/:id/limits/preview`、`/lower`
 
 保管员下调**已登记**年度上限前先预演（拟定上限必须为正数且**低于现行上限**，否则 400）。
@@ -535,8 +647,8 @@ src/
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、下调上限预演核算、停灯登记校验与按年扣减
-  routes/          auth/users/exhibits/plans/adjustments/measurements/blackouts/audit 路由
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements/blackouts/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 Dockerfile / docker-compose.yml

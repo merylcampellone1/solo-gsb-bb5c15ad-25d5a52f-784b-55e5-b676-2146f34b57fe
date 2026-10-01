@@ -90,8 +90,30 @@ async function withExhibitTransaction(exhibitId, work) {
   return withKeyLock(`exhibit:${exhibitId}`, () => withTransaction(work));
 }
 
+/**
+ * 跨多展品的串行化事务（联合核准等一次涉及多件展品的操作）：
+ *  - 应用层按展品 id 升序逐个取得键锁，避免多展品事务间循环等待；
+ *  - 事务内同样按升序 SELECT ... FOR UPDATE 锁展品行。
+ * 同一展品的联合核准与既有单展品事务经同一键锁互斥，不会超配。
+ */
+async function withExhibitsTransaction(exhibitIds, work) {
+  const ids = [...new Set(exhibitIds.map(Number))].sort((a, b) => a - b);
+  const runLocked = async (idx) => {
+    if (idx >= ids.length) {
+      return withTransaction(async (client) => {
+        for (const exId of ids) {
+          await client.query('SELECT id FROM exhibits WHERE id = $1 FOR UPDATE', [exId]);
+        }
+        return work(client);
+      });
+    }
+    return withKeyLock(`exhibit:${ids[idx]}`, () => runLocked(idx + 1));
+  };
+  return runLocked(0);
+}
+
 async function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction };
+module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withExhibitsTransaction };
