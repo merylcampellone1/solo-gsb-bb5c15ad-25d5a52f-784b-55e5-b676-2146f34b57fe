@@ -90,8 +90,24 @@ async function withExhibitTransaction(exhibitId, work) {
   return withKeyLock(`exhibit:${exhibitId}`, () => withTransaction(work));
 }
 
+/**
+ * 多展品串行化事务（联合核准等跨展品批量操作）：
+ *  - 应用层：按展品 id 升序依次获取键级互斥锁，全部持有时才开启单一事务，
+ *    避免与其他批量/单项事务形成等待环（后到者按相同顺序排队）；
+ *  - 事务内：调用方同样按 id 升序执行 SELECT ... FOR UPDATE。
+ * 同一请求内重复的展品 id 只取一次锁。
+ */
+function withMultiExhibitTransaction(exhibitIds, work) {
+  const ids = [...new Set(exhibitIds.map(Number))].sort((a, b) => a - b);
+  const run = (idx) => {
+    if (idx >= ids.length) return withTransaction(work);
+    return withKeyLock(`exhibit:${ids[idx]}`, () => run(idx + 1));
+  };
+  return run(0);
+}
+
 async function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction };
+module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withMultiExhibitTransaction };

@@ -183,6 +183,23 @@
         </div>
 
         <div id="plan-list"></div>
+
+        <div id="batch-box" class="card">
+          <h4>联合核准（一个布展场次涉及多条待批准计划）</h4>
+          <p class="muted small">按编号填写 2~10 条不同的<b>待批准</b>计划（逗号或空格分隔，可跨展品）。
+            布展员和保管员都可点「联合试算」：列出每条计划的展品、各自然年新增估算占用、原占用、上限及冲突；
+            同展品计划的开灯窗彼此不得重叠，也不得与其他已批准/待复核计划重叠，并按实测替代估算、停灯扣减口径做年度残余合并校验。
+            只有保管员可「提交联合核准」：提交时重新核对计划状态与实时占用，全部通过才一次批准；
+            任一失败则整组计划与审计均不变。</p>
+          <form id="batch-form" class="inline-form">
+            <label class="grow">计划编号
+              <input name="planIds" placeholder="如：12, 15, 18" required />
+            </label>
+            <button type="button" id="batch-preview-btn">联合试算</button>
+            <button type="button" id="batch-approve-btn" class="primary conservator-only">提交联合核准</button>
+          </form>
+          <div id="batch-result"></div>
+        </div>
       </section>
 
       <!-- 实测记录 -->

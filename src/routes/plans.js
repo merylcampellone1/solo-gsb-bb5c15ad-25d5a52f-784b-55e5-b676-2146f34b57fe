@@ -1,12 +1,13 @@
 'use strict';
 
 const express = require('express');
-const { query, withExhibitTransaction } = require('../db');
+const { query, withExhibitTransaction, withMultiExhibitTransaction } = require('../db');
 const { requireRole, requireAuth } = require('../auth');
 const { recordAudit } = require('../audit');
 const {
   ValidationError,
   nonEmptyString,
+  ConflictError,
 } = require('../validation');
 const {
   lockExhibit,
@@ -18,6 +19,7 @@ const {
   planOverlaps,
   decoratePlans,
   normalizeScheduleInput,
+  evaluatePlanBatch,
 } = require('../service');
 const {
   doseByYear,
@@ -25,7 +27,7 @@ const {
   buildWindows,
   subtractIntervals,
 } = require('../dosing');
-const { ConflictError, AuthError } = require('../validation');
+const { AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
 
 const router = express.Router();
@@ -113,6 +115,187 @@ router.post('/', requireRole('installer'), async (req, res, next) => {
 function buildWindowsSafe(input) {
   return buildWindows(input.startDate, input.endDate, input.periods);
 }
+
+// ---------------------------------------------------------------------------
+// 联合核准：2~10 条不同的待批准计划同时试算 / 同时批准（可跨展品）
+// 试算布展员与保管员均可调用；只有保管员可提交联合核准。
+// 必须注册在 '/:id' 之前，否则 '/batch/preview' 会被 ':id' 捕获。
+// ---------------------------------------------------------------------------
+
+/** 解析请求体中的计划编号：planIds 数组、长度 2~10、互不相同的正整数。 */
+function parseBatchIds(body) {
+  const raw = body && Array.isArray(body.planIds) ? body.planIds : null;
+  if (!raw || raw.length < 2 || raw.length > 10) {
+    throw new ValidationError('请提供 2 至 10 条不同计划的编号（planIds 数组，长度 2~10）');
+  }
+  const ids = raw.map(Number);
+  if (ids.some((n) => !Number.isInteger(n) || n <= 0)) {
+    throw new ValidationError('计划编号必须为正整数');
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new ValidationError('联合核准的计划编号必须互不相同');
+  }
+  return ids;
+}
+
+/** 锁外预检：计划均须存在；返回 { ids, exhibitIds }。状态/占用在锁事务内重新核对。 */
+async function loadBatchMeta(ids) {
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await query(
+    `SELECT id, exhibit_id FROM plans WHERE id IN (${placeholders})`,
+    ids
+  );
+  const found = new Map(rows.map((r) => [Number(r.id), Number(r.exhibit_id)]));
+  for (const id of ids) {
+    if (!found.has(id)) throw new ValidationError(`计划 #${id} 不存在`);
+  }
+  return { ids, exhibitIds: [...new Set(ids.map((id) => found.get(id)))] };
+}
+
+/** 在多展品事务内：按展品 id 升序加展品行锁，再执行核对。 */
+async function runBatchTransaction(exhibitIds, ids) {
+  return withMultiExhibitTransaction(exhibitIds, async (client) => {
+    for (const exId of [...exhibitIds].sort((a, b) => a - b)) {
+      await lockExhibit(client, exId);
+    }
+    return evaluatePlanBatch(client, ids);
+  });
+}
+
+/** 联合核对失败的中文原因汇总（错误信息与页面共用）。 */
+function batchConflictMessages(result) {
+  const c = result.conflicts;
+  const parts = [];
+  for (const p of c.invalidStatus) {
+    parts.push(`计划「${p.title}」(#${p.planId}) 当前状态为 ${p.status}，不是待批准`);
+  }
+  for (const o of c.intraGroupOverlaps) {
+    parts.push(
+      `组内同展品计划「${o.planTitle}」(#${o.planId}) 与「${o.otherTitle}」(#${o.otherPlanId}) 开灯时间重叠`
+    );
+  }
+  for (const p of c.overlappingPlans) {
+    parts.push(
+      `计划「${p.planTitle}」(#${p.planId}) 与同展品${p.other.status === 'pending_review' ? '待复核' : '已批准'}` +
+      `计划「${p.other.title}」(#${p.other.id}) 开灯时间重叠`
+    );
+  }
+  for (const m of c.missingLimits) {
+    parts.push(`展品 #${m.exhibitId} ${m.year} 年尚未登记年度额度`);
+  }
+  for (const o of c.overflows) {
+    const contrib = o.contributions
+      .map((ct) => `计划 #${ct.planId} 新增 ${ct.residue}`)
+      .join('，');
+    parts.push(
+      `展品 #${o.exhibitId} ${o.year} 年：上限 ${o.limit}，原占用 ${o.usedByOthers}，` +
+        `组内新增合计 ${o.addedByGroup}（${contrib}），合计 ${o.projected}，超额 ${o.excess} lx·h`
+    );
+  }
+  return parts;
+}
+
+/**
+ * 联合试算：布展员/保管员均可调用，不写库。
+ * 返回每条计划的展品、各自然年新增估算占用，以及按展品的原占用、上限、冲突。
+ */
+router.post('/batch/preview', async (req, res, next) => {
+  try {
+    const ids = parseBatchIds(req.body || {});
+    const { exhibitIds } = await loadBatchMeta(ids);
+    const result = await runBatchTransaction(exhibitIds, ids);
+    res.json({ batchPreview: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * 提交联合核准（仅保管员）：
+ * 在多展品锁事务内重新核对计划状态与实时占用（试算与提交口径一致），
+ * 全部通过才一次批准全部计划并记录审计；任一失败则整组计划与审计均不变（事务回滚），
+ * 返回涉及的计划、年份和冲突原因（409）。
+ */
+router.post('/batch/approve', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const ids = parseBatchIds(req.body || {});
+    const { exhibitIds } = await loadBatchMeta(ids);
+
+    const detail = await withMultiExhibitTransaction(exhibitIds, async (client) => {
+      for (const exId of [...exhibitIds].sort((a, b) => a - b)) {
+        await lockExhibit(client, exId);
+      }
+      // 锁内重新核对：计划状态与实时占用（预检/试算后可能已被他人改动）
+      const result = await evaluatePlanBatch(client, ids);
+      if (!result.ok) {
+        throw new ConflictError(
+          `联合核准未通过核对（计划 ${ids.map((x) => `#${x}`).join('、')}）：` +
+            batchConflictMessages(result).join('；'),
+          {
+            planIds: result.planIds,
+            conflicts: result.conflicts,
+            items: result.items,
+            exhibits: result.exhibits,
+          }
+        );
+      }
+
+      // 全部通过：一次批准全部计划 + 审计（每条计划一条审批审计 + 一条整组事件）
+      const approvedPlanIds = [];
+      for (const item of result.items) {
+        const upd = await client.query(
+          `UPDATE plans
+              SET status = 'approved', approved_by = $1, approved_at = now(),
+                  review_reason = NULL, updated_at = now()
+            WHERE id = $2 AND status = 'submitted'
+            RETURNING id, exhibit_id, status`,
+          [req.sessionUser.userId, item.planId]
+        );
+        if (upd.rows.length === 0) {
+          // 极端并发下状态在评估后被改：直接抛错回滚整组
+          throw new ConflictError(
+            `计划 #${item.planId} 状态在提交时已变化，本次联合核准整组未执行，请重新核对`,
+            { planIds: result.planIds, changedPlanId: item.planId }
+          );
+        }
+        approvedPlanIds.push(item.planId);
+        await recordAudit(client, req.sessionUser, 'plan.batch_approve_item',
+          'plan', item.planId, {
+            exhibitId: item.exhibitId,
+            batchPlanIds: result.planIds,
+            addedYearly: item.addedYearly,
+          });
+      }
+      await recordAudit(client, req.sessionUser, 'plan.batch_approve', 'plan', null, {
+        planIds: approvedPlanIds,
+        exhibitIds: result.exhibits.map((x) => x.exhibitId),
+      });
+
+      // 返回各相关展品的最新详情；单展品时同时把该展品详情字段铺到顶层（与单条批准同构）
+      const exhibitDetails = {};
+      for (const ex of result.exhibits) {
+        exhibitDetails[String(ex.exhibitId)] = await exhibitDetail(client, ex.exhibitId, { lock: true });
+      }
+      const payload = {
+        batchApproval: {
+          planIds: approvedPlanIds,
+          exhibitIds: result.exhibits.map((x) => x.exhibitId),
+          items: result.items,
+          exhibits: result.exhibits,
+        },
+        exhibitDetails,
+      };
+      if (result.exhibits.length === 1) {
+        Object.assign(payload, exhibitDetails[String(result.exhibits[0].exhibitId)]);
+      }
+      return payload;
+    });
+
+    res.json(detail);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // 计划详情
 router.get('/:id', async (req, res, next) => {

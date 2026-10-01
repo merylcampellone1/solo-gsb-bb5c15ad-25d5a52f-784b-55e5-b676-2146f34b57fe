@@ -62,6 +62,20 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       （估算残余 = 开灯窗 − 已确认实测覆盖 − 本计划停灯）；调整/成对核准还要求**既有停灯仍落在拟改新窗内**。
     - 后续实测**录入或确认碰到停灯时段一律拒绝**。展品详情展示全部停灯记录及**各年扣减量**，
       既有查询字段保持兼容（仅附加新字段）。
+14. **联合核准（一组待批准计划同时获批）**：一个布展场次涉及多条计划时，保管员按编号选择
+    **2 至 10 条不同的待批准（submitted）计划**（**可跨展品**）决定整组能否同时获批。
+    - **布展员和保管员均可试算**（`POST /api/plans/batch/preview`），列出每条计划的展品、
+      **各自然年新增估算占用**，以及按展品的**原占用、年度上限、合计/剩余/超额与冲突**；试算不写库。
+    - **只有保管员可提交联合核准**（`POST /api/plans/batch/approve`）。
+    - **开灯窗重叠规则**：组内**同展品**计划的开灯窗须**彼此不重叠**，且**分别**不得与同展品
+      **其他已批准或待复核**计划重叠（日期重叠但开灯时刻不相交允许；跨展品计划互不相干）。
+    - **年度残余合并校验**：按**实测替代估算、停灯扣减**的统一口径计算每条计划的新增估算残余
+      （开灯窗 − 本计划已确认实测 − 本计划停灯），把**组内同展品各计划**的年度残余合并，
+      叠加展品当前占用（原占用，不含组内待批准计划），任一年超年度上限或未登记上限即冲突。
+    - **提交时重新核对**计划状态与**实时占用**（多展品按展品 id 顺序加行锁，与单条批准互斥）：
+      **全部通过才一次批准全部计划并记录审计**（逐条 `plan.batch_approve_item` + 整组 `plan.batch_approve`）；
+      **任一失败则整组计划与审计均不变**（事务回滚），409 返回涉及的**计划、年份和冲突原因**。
+    - 既有**单条审批**与**展品详情**等响应字段和行为保持兼容。
 
 ## 一键启动（Docker Compose）
 
@@ -151,8 +165,13 @@ npm run test:utils
    填写已发生的起止时刻与**必填原因**后登记：系统校验起止顺序、结束不晚于当前、完整落在开灯窗内、
    不与未作废实测或其他停灯相交；通过后该时段按计划预计照度从估算中按自然年扣减（不减已确认实测、
    不释放排期）。停灯记录保留、不可改删，布展员只读；之后录入/确认碰到该时段的实测会被拒绝。
+10. 一个**布展场次涉及多条计划**时，在「布展计划」页底部「联合核准」面板按编号填入 2~10 条不同的
+    待批准计划（逗号分隔，可跨展品），先点「联合试算」（布展员、保管员均可）查看每条计划的展品、
+    各自然年新增估算占用、原占用、上限与冲突；确认无误后由**保管员**点「提交联合核准」。
+    系统在多展品锁事务内重新核对计划状态与实时占用，全部通过才一次批准并记审计；
+    任一冲突都会整组拒绝（计划与审计均不变），并列出涉及的计划、年份和冲突原因。
 
-## HTTP API（含计划调整申请、成对核准、年度上限下调预演、停灯登记）
+## HTTP API（含计划调整申请、成对核准、联合核准、年度上限下调预演、停灯登记）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -182,7 +201,9 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET  /api/plans?exhibitId=` | 登录 | 计划列表（附加 `notStarted`、`pendingAdjustment` 概要） |
 | `POST /api/plans` | 布展员 | 创建计划 |
 | `GET  /api/plans/:id` | 登录 | 计划详情（待审申请带 `preview` 原值/拟改值试算） |
-| `POST /api/plans/:id/approve` | 保管员 | 批准 / 复核通过 |
+| `POST /api/plans/batch/preview` | 登录 | **联合试算**：2~10 条不同待批准计划（可跨展品）的整组核对，不写库 |
+| `POST /api/plans/batch/approve` | 保管员 | **提交联合核准**：锁事务内重核，全部通过才一次批准并记审计 |
+| `POST /api/plans/:id/approve` | 保管员 | 批准 / 复核通过（既有单条审批，行为不变） |
 | `POST /api/plans/:id/reject` | 保管员 | 驳回落计划 |
 | `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
 | `GET/POST /api/measurements`、`POST /api/measurements/:id/confirm`、`DELETE /api/measurements/:id` | 保管员 | 实测录入/确认/删草稿 |
@@ -362,6 +383,126 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/pair
 成功响应与单份批准同构（展品详情字段位于顶层），另附 `pairApproval`
 （`adjustmentIds`/`planIds`/`items`/`yearlyReport`）。单份审批与既有查询接口的字段和行为不变。
 
+成功响应与单份批准同构（展品详情字段位于顶层），另附 `pairApproval`
+（`adjustmentIds`/`planIds`/`items`/`yearlyReport`）。单份审批与既有查询接口的字段和行为不变。
+
+### 联合核准 `/api/plans/batch/*`（2~10 条待批准计划同时获批，可跨展品）
+
+一个布展场次涉及多条计划时，按编号选择 **2 至 10 条不同的待批准（`submitted`）计划**整组试算、整组批准。
+**布展员与保管员均可试算；只有保管员可提交联合核准。**
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/plans/batch/preview` | 登录 | 联合试算：列出每条计划展品/各年新增估算占用，以及按展品的原占用、上限、合并残余与冲突，不写库 |
+| `POST /api/plans/batch/approve` | 保管员 | 提交联合核准：多展品锁事务内重新核对状态与实时占用，全部通过才一次批准并记审计 |
+
+请求体均为：
+
+```json
+{ "planIds": [12, 15, 18] }
+```
+
+组成性拒绝（**400**，试算与提交一致）：不是数组、数量不在 2~10、编号重复、非正整数、计划不存在；
+布展员提交核准 → 403。
+
+试算响应（`batchPreview`，不写库）：
+
+```json
+{
+  "batchPreview": {
+    "ok": false,
+    "planIds": [12, 15],
+    "conflicts": {
+      "invalidStatus": [],
+      "intraGroupOverlaps": [
+        { "exhibitId": 3, "planId": 12, "planTitle": "日场",
+          "otherPlanId": 15, "otherTitle": "夜场" }
+      ],
+      "overlappingPlans": [
+        { "exhibitId": 3, "planId": 18, "planTitle": "加开场",
+          "other": { "id": 7, "title": "夜场", "status": "approved",
+                     "startDate": "2031-01-01", "endDate": "2031-01-03" } }
+      ],
+      "overflows": [
+        { "exhibitId": 3, "year": 2031, "limit": 5000, "usedByOthers": 4200,
+          "addedByGroup": 1200, "projected": 5400, "remainingAfter": -400, "excess": 400,
+          "contributions": [
+            { "planId": 12, "title": "日场", "residue": 800 },
+            { "planId": 15, "title": "夜场", "residue": 400 }
+          ] }
+      ],
+      "missingLimits": [ { "exhibitId": 3, "year": 2034 } ]
+    },
+    "items": [
+      { "planId": 12, "exhibitId": 3, "title": "日场", "status": "submitted",
+        "startDate": "2031-01-02", "endDate": "2031-01-02",
+        "periods": ["09:00-17:00"], "lux": 100,
+        "addedYearly": { "2031": 800 } },
+      { "planId": 15, "exhibitId": 3, "title": "夜场", "status": "submitted",
+        "startDate": "2031-01-02", "endDate": "2031-01-02",
+        "periods": ["18:00-22:00"], "lux": 100,
+        "addedYearly": { "2031": 400 } }
+    ],
+    "exhibits": [
+      { "exhibitId": 3, "exhibitName": "宋拓本",
+        "years": {
+          "2031": { "year": 2031, "limit": 5000, "usedByOthers": 4200,
+                    "addedByGroup": 1200, "projected": 5400,
+                    "remainingAfter": -400, "excess": 400,
+                    "contributions": [ ] }
+        } }
+    ]
+  }
+}
+```
+
+字段口径：
+
+- `items[].addedYearly`：每条计划**各自然年新增估算占用**，统一按
+  **实测替代估算、停灯扣减**口径计算（开灯窗 − 本计划已确认实测覆盖 − 本计划停灯）。
+- `exhibits[].years[year]`：`usedByOthers` 为该展品当前**原占用**（已确认实测 + 其他已批准/待复核
+  计划估算残余，**不含组内待批准计划**）；`addedByGroup` 为**组内同展品各计划年度残余合计**；
+  `projected = usedByOthers + addedByGroup`；超限给 `excess`，未登记上限列入 `missingLimits`。
+- 冲突分类：`invalidStatus`（不是待批准）、`intraGroupOverlaps`（组内同展品互相重叠）、
+  `overlappingPlans`（与其他已批准/待复核计划重叠）、`overflows`（按年超额）、
+  `missingLimits`（组内占用年份未登记上限）。**跨展品**计划的开灯窗互不判定重叠，年度残余也
+  **只在同展品内合并**。
+
+curl 调用示例：
+
+```bash
+# 1) 联合试算（布展员或保管员均可；不写库）
+curl -b cookies.txt -X POST http://localhost:3000/api/plans/batch/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"planIds":[12,15,18]}'
+
+# 2) 保管员提交联合核准（成功返回展品详情；跨展品时用 exhibitDetails 按展品返回）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/plans/batch/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"planIds":[12,15,18]}'
+```
+
+提交在多展品锁事务内（按展品 id 升序，与单条批准互斥）**重新核对计划状态与实时占用**：
+全部通过才一次批准全部计划，并写逐条审批审计（`plan.batch_approve_item`）与一条整组审计
+（`plan.batch_approve`，`detail.planIds`）。任一失败则**事务回滚，整组计划与审计均不变**，返回 **409**：
+
+```json
+{
+  "error": "联合核准未通过核对（计划 #12、#15）：组内同展品计划「日场」(#12) 与「夜场」(#15) 开灯时间重叠；展品 #3 2031 年：上限 5000，原占用 4200，组内新增合计 1200（计划 #12 新增 800，计划 #15 新增 400），合计 5400，超额 400 lx·h",
+  "details": {
+    "planIds": [12, 15],
+    "conflicts": { "intraGroupOverlaps": [], "overlappingPlans": [], "overflows": [], "missingLimits": [] },
+    "items": [ "每条计划的展品与各年新增残余（同试算）" ],
+    "exhibits": [ "按展品的原占用/上限/合并残余/超额（同试算）" ]
+  }
+}
+```
+
+成功响应：**单展品**时与单条批准同构——展品详情字段（`exhibit`/`years`/`plans`/`measurements`/
+`blackouts` 等）位于顶层；**跨展品**时这些字段位于 `exhibitDetails`（按展品 id 索引）。
+两种情形都另附 `batchApproval` 摘要（`planIds`/`exhibitIds`/`items`/`exhibits`）。
+既有**单条审批**（`POST /api/plans/:id/approve`）与**展品详情**响应字段和行为不变。
+
 ### 下调年度上限 `/api/exhibits/:id/limits/preview`、`/lower`
 
 保管员下调**已登记**年度上限前先预演（拟定上限必须为正数且**低于现行上限**，否则 400）。
@@ -527,7 +668,7 @@ src/
   server.js        启动入口（等待数据库、初始化、起 HTTP 服务）
   app.js           Express 应用与统一错误处理
   config.js        环境变量配置
-  db.js            pg 连接池、事务封装、类型解析
+  db.js            pg 连接池、事务封装（含多展品按序加锁事务）、类型解析
   init.js          建表、初始账号、演示数据
   schema.sql       表结构
   auth.js          会话与角色中间件、bcrypt 登录校验
@@ -535,7 +676,7 @@ src/
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、下调上限预演核算、停灯登记校验与按年扣减
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组核对、下调上限预演核算、停灯登记校验与按年扣减
   routes/          auth/users/exhibits/plans/adjustments/measurements/blackouts/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试

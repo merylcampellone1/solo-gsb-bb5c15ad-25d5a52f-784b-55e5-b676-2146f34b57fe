@@ -718,6 +718,109 @@ document.addEventListener('click', async (e) => {
   } catch (err) { flash('error', err.message); }
 });
 
+// ---------- 联合核准（2~10 条待批准计划同时试算/批准）----------
+function parseBatchInput(text) {
+  const ids = String(text || '').split(/[\s,，、;；]+/).filter(Boolean).map(Number);
+  if (!ids.length || ids.some((n) => !Number.isInteger(n) || n <= 0)) {
+    throw new Error('请输入 2~10 个正整数计划编号');
+  }
+  if (ids.length < 2 || ids.length > 10) throw new Error('请选择 2 至 10 条计划');
+  if (new Set(ids).size !== ids.length) throw new Error('计划编号不能重复');
+  return ids;
+}
+
+function renderBatchResult(result) {
+  if (!result) return '<p class="muted">暂无试算结果。</p>';
+  const c = result.conflicts || {};
+  const ok = result.ok;
+  const itemsHtml = (result.items || []).map((it) => `
+    <tr>
+      <td>#${it.planId}</td>
+      <td>#${it.exhibitId}</td>
+      <td>${esc(it.title)}</td>
+      <td>${esc(it.startDate)} ~ ${esc(it.endDate)}</td>
+      <td>${(it.periods || []).map(esc).join('<br>')}</td>
+      <td class="mono">${fmtN(it.lux)} lx</td>
+      <td>${yearlyText(it.addedYearly)}</td>
+    </tr>`).join('');
+  const exhibitsHtml = (result.exhibits || []).map((ex) => {
+    const rows = Object.values(ex.years || {}).map((y) => `
+      <tr class="${y.excess ? 'over-row' : ''}">
+        <td>${y.year}</td>
+        <td class="mono">${fmtN(y.limit)}</td>
+        <td class="mono">${fmtN(y.usedByOthers)}</td>
+        <td class="mono">${fmtN(y.addedByGroup)}</td>
+        <td class="mono">${fmtN(y.projected)}</td>
+        <td class="mono">${y.remainingAfter === null ? '—' : fmtN(y.remainingAfter)}</td>
+        <td class="mono">${y.excess ? `<span class="over">超 ${fmtN(y.excess)}</span>` : '—'}</td>
+      </tr>`).join('');
+    return `<div class="batch-exhibit">
+      <div class="small muted">展品 #${ex.exhibitId}${ex.exhibitName ? `「${esc(ex.exhibitName)}」` : ''}</div>
+      <table class="data"><thead><tr>
+        <th>年份</th><th>上限</th><th>原占用</th><th>组内新增</th><th>合计</th><th>剩余</th><th>冲突</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join('');
+  const conflictList = [];
+  for (const x of c.invalidStatus || []) conflictList.push(`计划「${x.title}」(#${x.planId}) 当前状态为 ${STATUS_TEXT[x.status] || x.status}，不是待批准`);
+  for (const x of c.intraGroupOverlaps || []) conflictList.push(`组内同展品计划「${x.planTitle}」(#${x.planId}) 与「${x.otherTitle}」(#${x.otherPlanId}) 开灯时间重叠`);
+  for (const x of c.overlappingPlans || []) conflictList.push(`计划「${x.planTitle}」(#${x.planId}) 与同展品${x.other.status === 'pending_review' ? '待复核' : '已批准'}计划「${x.other.title}」(#${x.other.id}) 开灯时间重叠`);
+  for (const x of c.missingLimits || []) conflictList.push(`展品 #${x.exhibitId} ${x.year} 年尚未登记年度额度`);
+  for (const o of c.overflows || []) {
+    const contrib = (o.contributions || []).map((ct) => `#${ct.planId} 新增 ${fmtN(ct.residue)}`).join('，');
+    conflictList.push(`展品 #${o.exhibitId} ${o.year} 年：上限 ${fmtN(o.limit)}，原占用 ${fmtN(o.usedByOthers)}，组内新增 ${fmtN(o.addedByGroup)}（${contrib}），合计 ${fmtN(o.projected)}，超额 ${fmtN(o.excess)} lx·h`);
+  }
+  return `
+    <div class="${ok ? 'flash success' : 'flash error'}">${ok ? '试算通过：整组可以联合核准' : '试算未通过，存在以下冲突'}</div>
+    ${conflictList.length ? `<ul class="conflict-list">${conflictList.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+    <table class="data"><thead><tr>
+      <th>计划</th><th>展品</th><th>名称</th><th>展期</th><th>每日开灯</th><th>预计照度</th><th>各年新增估算占用</th>
+    </tr></thead><tbody>${itemsHtml}</tbody></table>
+    ${exhibitsHtml}`;
+}
+
+async function batchAction(kind) {
+  const form = $('#batch-form');
+  let ids;
+  try {
+    ids = parseBatchInput(form.elements.planIds.value);
+  } catch (err) {
+    $('#batch-result').innerHTML = `<div class="flash error">${esc(err.message)}</div>`;
+    return;
+  }
+  const url = kind === 'approve' ? '/api/plans/batch/approve' : '/api/plans/batch/preview';
+  try {
+    const data = await api('POST', url, { planIds: ids });
+    if (kind === 'approve') {
+      $('#batch-result').innerHTML =
+        '<div class="flash success">联合核准成功：整组计划已一次批准</div>';
+      form.elements.planIds.value = '';
+      flash('success', `联合核准成功：已批准计划 ${ids.map((x) => `#${x}`).join('、')}`);
+      await loadPlans();
+    } else {
+      $('#batch-result').innerHTML = renderBatchResult(data.batchPreview);
+    }
+  } catch (err) {
+    if (kind === 'approve') {
+      // 409：整组未通过，错误信息置顶，下方复用同一张明细表（去掉重复的结论条）
+      const d = err.data || {};
+      let detailHtml = '';
+      if (d.details && d.details.items) {
+        const rendered = renderBatchResult(
+          { ok: false, conflicts: d.details.conflicts, items: d.details.items, exhibits: d.details.exhibits }
+        );
+        detailHtml = rendered.replace(/^<div class="[^"]*">.*?<\/div>/, '');
+      }
+      $('#batch-result').innerHTML =
+        `<div class="flash error">${esc(err.message)}</div>${detailHtml}`;
+      flash('error', '联合核准未通过，整组计划与审计均不变');
+    } else {
+      $('#batch-result').innerHTML = `<div class="flash error">${esc(err.message)}</div>`;
+    }
+  }
+}
+$('#batch-preview-btn').addEventListener('click', () => batchAction('preview'));
+$('#batch-approve-btn').addEventListener('click', () => batchAction('approve'));
+
 // ---------- 计划调整申请 ----------
 /** 打开发起调整申请的表单（预填原值）。 */
 async function openAdjustmentForm(planId) {

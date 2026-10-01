@@ -132,3 +132,13 @@ table.diff-table th, table.diff-table td { border: 1px solid #dde5ee; padding: 4
 table.diff-table th { background: #eef3f8; width: 64px; font-weight: 600; }
 table.diff-table td.changed { background: #fff5e0; color: #9a6700; }
 .ok { color: #176b3a; }
+
+/* 联合核准 */
+#batch-box { margin-top: 14px; }
+#batch-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+#batch-form .grow { flex: 1 1 260px; }
+#batch-result { margin-top: 8px; }
+#batch-result .data { margin: 8px 0; }
+.batch-exhibit { margin: 10px 0; }
+.conflict-list { color: #8a2c22; margin: 6px 0 6px 20px; padding: 0; }
+.conflict-list li { margin: 2px 0; }

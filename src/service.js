@@ -1068,6 +1068,224 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
   return { ok, conflicts, items, yearlyReport };
 }
 
+// ---------------------------------------------------------------------------
+// 联合核准：2~10 条待批准计划同时试算/同时批准（可跨展品）
+// ---------------------------------------------------------------------------
+
+/**
+ * 联合核准试算/核对（事务内、已持有全部相关展品行锁后调用）：
+ * 入组计划必须全部为 submitted（待批准）；规则：
+ *   1) 同展品的组内计划开灯窗彼此不得重叠；
+ *   2) 每条计划开灯窗不得与同展品其他已批准/待复核计划重叠（跨展品计划互不相干）；
+ *   3) 按自然年把“组内同展品各计划的新增估算残余”合并，叠加展品当前占用（原占用，
+ *      不含组内待批准计划），任一年超过该展品年度上限即冲突；未登记上限的年份也算冲突。
+ * 新增估算残余口径与单条批准完全一致：开灯窗 − 本计划已确认实测覆盖 − 本计划停灯。
+ *
+ * planIds：已由路由做组成性校验（2~10 个互不相同整数、计划均存在）。
+ * 返回 {
+ *   ok, planIds, plans,
+ *   conflicts: { invalidStatus, intraGroupOverlaps, overlappingPlans,
+ *                overflows, missingLimits },
+ *   items: 每条计划 { planId, exhibitId, title, status, startDate, endDate,
+ *                     periods, lux, addedYearly },
+ *   exhibits: 按展品 [{ exhibitId, exhibitName, years: { [year]: {
+ *                year, limit, usedByOthers, addedByGroup, projected,
+ *                remainingAfter, excess, contributions } } }]
+ * }
+ */
+async function evaluatePlanBatch(client, planIds, nowMs = Date.now()) {
+  void nowMs;
+  const conflicts = {
+    invalidStatus: [],
+    intraGroupOverlaps: [],
+    overlappingPlans: [],
+    overflows: [],
+    missingLimits: [],
+  };
+
+  // 1) 载入计划（按输入顺序返回；存在性由路由保证，此处再防御一次）
+  const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows } = await client.query(
+    `SELECT * FROM plans WHERE id IN (${placeholders})`,
+    planIds
+  );
+  const byId = new Map(rows.map((p) => [Number(p.id), p]));
+  const plans = [];
+  for (const id of planIds) {
+    const p = byId.get(Number(id));
+    if (!p) throw new ValidationError(`计划 #${id} 不存在`);
+    plans.push(p);
+  }
+
+  for (const plan of plans) {
+    if (plan.status !== 'submitted') {
+      conflicts.invalidStatus.push({
+        planId: Number(plan.id),
+        title: plan.title,
+        status: plan.status,
+      });
+    }
+  }
+
+  const entries = plans.map((plan) => ({ plan, windows: planWindows(plan) }));
+
+  // 2) 按展品分组（联合核准允许跨展品；重叠与额度校验都只在同展品内进行）
+  const groups = new Map();
+  for (const e of entries) {
+    const exId = Number(e.plan.exhibit_id);
+    if (!groups.has(exId)) groups.set(exId, []);
+    groups.get(exId).push(e);
+  }
+
+  // 展品名称
+  const exPlaceholders = [...groups.keys()].map((_, i) => `$${i + 1}`).join(',');
+  const { rows: exRows } = await client.query(
+    `SELECT id, name FROM exhibits WHERE id IN (${exPlaceholders})`,
+    [...groups.keys()]
+  );
+  const exhibitNameById = new Map(exRows.map((r) => [Number(r.id), r.name]));
+
+  // 3) 每条计划新增估算残余：开灯窗 − 本计划已确认实测 − 本计划停灯（与单条批准同口径）
+  for (const e of entries) {
+    const plan = e.plan;
+    const { rows: measRows } = await client.query(
+      `SELECT start_ts, end_ts FROM measurements WHERE plan_id = $1 AND status = 'confirmed'`,
+      [plan.id]
+    );
+    const selfMeas = measRows.map((m) => ({
+      start: new Date(m.start_ts).getTime(),
+      end: new Date(m.end_ts).getTime(),
+    }));
+    const { rows: blackoutRows } = await client.query(
+      `SELECT start_ts, end_ts FROM blackouts WHERE plan_id = $1 ORDER BY id`,
+      [plan.id]
+    );
+    const selfBlackouts = blackoutRows.map((b) => ({
+      start: new Date(b.start_ts).getTime(),
+      end: new Date(b.end_ts).getTime(),
+    }));
+    const remaining = subtractIntervals(e.windows, [...selfMeas, ...selfBlackouts]);
+    e.addedYearly = yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+  }
+
+  // 4) 同展品组内两两开灯窗不得重叠
+  for (const [exId, list] of groups) {
+    void exId;
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        if (anyIntersect(list[i].windows, list[j].windows)) {
+          conflicts.intraGroupOverlaps.push({
+            exhibitId: Number(list[i].plan.exhibit_id),
+            planId: Number(list[i].plan.id),
+            planTitle: list[i].plan.title,
+            otherPlanId: Number(list[j].plan.id),
+            otherTitle: list[j].plan.title,
+          });
+        }
+      }
+    }
+  }
+
+  // 5) 与同展品其他已批准/待复核计划的开灯时刻重叠
+  for (const [exId, list] of groups) {
+    const others = await getOccupyingPlans(client, exId);
+    const groupIds = new Set(list.map((e) => Number(e.plan.id)));
+    for (const e of list) {
+      for (const other of others) {
+        if (groupIds.has(Number(other.id))) continue; // 组内计划均为 submitted，本不在占用集，防御性排除
+        if (anyIntersect(e.windows, planWindows(other))) {
+          conflicts.overlappingPlans.push({
+            exhibitId: exId,
+            planId: Number(e.plan.id),
+            planTitle: e.plan.title,
+            other: {
+              id: Number(other.id),
+              title: other.title,
+              status: other.status,
+              startDate: dateYmd(other.start_date),
+              endDate: dateYmd(other.end_date),
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // 6) 按展品/自然年合并残余，叠加原占用（当前占用不含组内待批准计划）后做额度校验
+  const exhibitReports = [];
+  for (const [exId, list] of groups) {
+    const occupancy = await computeOccupancy(client, exId);
+    const yearsSet = new Set([
+      ...Object.keys(occupancy.limits),
+      ...Object.keys(occupancy.used),
+      ...list.flatMap((e) => Object.keys(e.addedYearly)),
+    ].map(Number));
+
+    const yearReport = {};
+    for (const year of [...yearsSet].sort((a, b) => a - b)) {
+      const key = String(year);
+      const limit = occupancy.limits[key] !== undefined && occupancy.limits[key] !== null
+        ? round3(occupancy.limits[key]) : null;
+      const usedByOthers = round3(occupancy.used[key] || 0);
+      const contributions = list.map((e) => ({
+        planId: Number(e.plan.id),
+        title: e.plan.title,
+        residue: round3(e.addedYearly[key] || 0),
+      })).filter((c) => c.residue !== 0);
+      const addedByGroup = round3(
+        list.reduce((s, e) => s + (e.addedYearly[key] || 0), 0)
+      );
+      const projected = round3(usedByOthers + addedByGroup);
+      const row = {
+        year,
+        limit,
+        usedByOthers,
+        addedByGroup,
+        projected,
+        remainingAfter: limit === null ? null : round3(limit - projected),
+        excess: null,
+        contributions,
+      };
+      if (limit === null) {
+        if (addedByGroup > 0) {
+          conflicts.missingLimits.push({ exhibitId: exId, year: Number(year) });
+        }
+      } else if (projected - limit > 0.005) {
+        row.excess = round3(projected - limit);
+        conflicts.overflows.push({ exhibitId: exId, ...row });
+      }
+      yearReport[key] = row;
+    }
+
+    exhibitReports.push({
+      exhibitId: exId,
+      exhibitName: exhibitNameById.get(exId) || null,
+      years: yearReport,
+    });
+  }
+
+  const ok =
+    conflicts.invalidStatus.length === 0 &&
+    conflicts.intraGroupOverlaps.length === 0 &&
+    conflicts.overlappingPlans.length === 0 &&
+    conflicts.overflows.length === 0 &&
+    conflicts.missingLimits.length === 0;
+
+  const items = entries.map((e) => ({
+    planId: Number(e.plan.id),
+    exhibitId: Number(e.plan.exhibit_id),
+    title: e.plan.title,
+    status: e.plan.status,
+    startDate: dateYmd(e.plan.start_date),
+    endDate: dateYmd(e.plan.end_date),
+    periods: normalizePeriods(e.plan.light_periods),
+    lux: Number(e.plan.estimated_lux),
+    addedYearly: e.addedYearly,
+  }));
+
+  return { ok, planIds: planIds.map(Number), conflicts, items, exhibits: exhibitReports };
+}
+
 /**
  * 给计划行附加：
  *  - notStarted：首个开灯时刻是否尚未到来
@@ -1317,6 +1535,7 @@ module.exports = {
   adjustmentWindows,
   evaluateAdjustment,
   evaluateAdjustmentPair,
+  evaluatePlanBatch,
   decoratePlans,
   serializeAdjustment,
 };
